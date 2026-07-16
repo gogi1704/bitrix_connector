@@ -1,11 +1,11 @@
 import uvicorn
 
-from app.config import APP_HOST, APP_PORT
+from app.config import Config
 
 if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
-        host=APP_HOST,
-        port=APP_PORT,
+        host=Config.APP_HOST,
+        port=Config.APP_PORT,
         reload=True
     )

@@ -1,7 +1,32 @@
-from dotenv import load_dotenv
 import os
+from pathlib import Path
 
-load_dotenv()
+from dotenv import load_dotenv
 
-APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
-APP_PORT = int(os.getenv("APP_PORT", 8000))
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "storage"
+
+# Always load the project .env, regardless of the directory from which uvicorn
+# was started.
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+class Config:
+    APP_HOST = os.getenv("APP_HOST", "127.0.0.1")
+    APP_PORT = int(os.getenv("APP_PORT", 8000))
+
+    # Support the existing .env names and the more explicit BITRIX_* variants.
+    CLIENT_ID = os.getenv("BITRIX_CLIENT_ID") or os.getenv("CLIENT_ID", "")
+    CLIENT_SECRET = os.getenv("BITRIX_CLIENT_SECRET") or os.getenv("CLIENT_SECRET", "")
+    BITRIX_DOMAIN = os.getenv("BITRIX_DOMAIN", "")
+    BITRIX_ACCESS_TOKEN = os.getenv("BITRIX_ACCESS_TOKEN", "")
+    BITRIX_OPENLINE_ID = os.getenv("BITRIX_OPENLINE_ID", "17")
+    PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    BITRIX_APPLICATION_TOKEN = os.getenv("BITRIX_APPLICATION_TOKEN", "")
+    MAX_API_URL = os.getenv("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
+    MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
+    MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")
+    MAX_CONNECTOR_ID = os.getenv("MAX_CONNECTOR_ID", "max_bot_bridge")
+    JOB_MAX_ATTEMPTS = int(os.getenv("JOB_MAX_ATTEMPTS", 8))
+    JOB_POLL_SECONDS = float(os.getenv("JOB_POLL_SECONDS", 0.5))
