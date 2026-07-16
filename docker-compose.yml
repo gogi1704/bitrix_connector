@@ -1,9 +1,17 @@
+name: bitrix-max-connector
+
 services:
   connector:
     build: .
     env_file: .env
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${CONNECTOR_HOST_PORT:-8001}:8000"
     volumes:
       - ./storage:/app/storage
     restart: unless-stopped
+    networks:
+      - connector_internal
+
+networks:
+  connector_internal:
+    name: bitrix-max-connector-internal
