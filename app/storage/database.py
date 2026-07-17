@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from app.config import DATA_DIR
 
@@ -22,6 +24,7 @@ class MessageDatabase:
                     external_user_name TEXT,
                     bitrix_chat_id TEXT,
                     bitrix_session_id TEXT,
+                    welcome_sent INTEGER NOT NULL DEFAULT 0,
                     line_id INTEGER NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -52,17 +55,45 @@ class MessageDatabase:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE INDEX IF NOT EXISTS messages_external_idx
+                    ON messages(dialog_id, direction, external_message_id);
                 CREATE INDEX IF NOT EXISTS jobs_ready_idx ON jobs(state, available_at, id);
                 """
             )
+            dialog_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(dialogs)").fetchall()
+            }
+            if "welcome_sent" not in dialog_columns:
+                connection.execute(
+                    "ALTER TABLE dialogs ADD COLUMN welcome_sent INTEGER NOT NULL DEFAULT 0"
+                )
+                # Jobs completed by older versions sent the welcome after
+                # recording the synthetic max-start message.
+                connection.execute(
+                    """
+                    UPDATE dialogs
+                    SET welcome_sent = 1
+                    WHERE EXISTS (
+                        SELECT 1 FROM messages
+                        WHERE messages.dialog_id = dialogs.id
+                          AND messages.external_message_id = 'max-start-' || dialogs.external_chat_id
+                    )
+                    """
+                )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.PATH, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def upsert_dialog(
         self,
@@ -83,8 +114,8 @@ class MessageDatabase:
                     bitrix_chat_id, bitrix_session_id, line_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(channel, external_chat_id) DO UPDATE SET
-                    external_user_id=excluded.external_user_id,
-                    external_user_name=excluded.external_user_name,
+                    external_user_id=COALESCE(excluded.external_user_id, dialogs.external_user_id),
+                    external_user_name=COALESCE(excluded.external_user_name, dialogs.external_user_name),
                     bitrix_chat_id=COALESCE(excluded.bitrix_chat_id, dialogs.bitrix_chat_id),
                     bitrix_session_id=COALESCE(excluded.bitrix_session_id, dialogs.bitrix_session_id),
                     line_id=excluded.line_id,
@@ -105,6 +136,21 @@ class MessageDatabase:
                 (channel, external_chat_id),
             ).fetchone()
             return int(row["id"])
+
+    def get_dialog(self, *, channel: str, external_chat_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM dialogs WHERE channel = ? AND external_chat_id = ?",
+                (channel, external_chat_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def mark_welcome_sent(self, dialog_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE dialogs SET welcome_sent=1, updated_at=CURRENT_TIMESTAMP WHERE id = ?",
+                (dialog_id,),
+            )
 
     def save_message(
         self,
@@ -134,12 +180,7 @@ class MessageDatabase:
             )
 
     def has_dialog(self, *, channel: str, external_chat_id: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM dialogs WHERE channel = ? AND external_chat_id = ?",
-                (channel, external_chat_id),
-            ).fetchone()
-            return row is not None
+        return self.get_dialog(channel=channel, external_chat_id=external_chat_id) is not None
 
     def enqueue(self, *, job_type: str, payload: dict, dedupe_key: str) -> bool:
         with self._connect() as connection:

@@ -24,6 +24,12 @@ class Config:
     BITRIX_OPENLINE_ID = os.getenv("BITRIX_OPENLINE_ID", "17")
     PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     BITRIX_APPLICATION_TOKEN = os.getenv("BITRIX_APPLICATION_TOKEN", "")
+    # A separate token is preferred. Falling back to the Bitrix application
+    # token keeps existing installations operable while still protecting the
+    # administrative HTTP endpoints.
+    CONNECTOR_ADMIN_TOKEN = (
+        os.getenv("CONNECTOR_ADMIN_TOKEN") or BITRIX_APPLICATION_TOKEN
+    )
     MAX_API_URL = os.getenv("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
     MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
     MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")

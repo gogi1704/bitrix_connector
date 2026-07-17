@@ -1,3 +1,6 @@
+import ipaddress
+from urllib.parse import urlparse
+
 import httpx
 
 from app.config import Config
@@ -25,10 +28,27 @@ class BitrixClient:
     @property
     def base_url(self):
         if self.oauth.client_endpoint:
-            return f"{self.oauth.client_endpoint.rstrip('/')}/"
+            endpoint = self.oauth.client_endpoint.rstrip("/")
+        else:
+            domain = self.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+            endpoint = f"https://{domain}/rest"
 
-        domain = self.domain.removeprefix("https://").removeprefix("http://").rstrip("/")
-        return f"https://{domain}/rest/"
+        parsed = urlparse(endpoint)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise RuntimeError("Bitrix endpoint must be an authenticated HTTPS URL")
+
+        hostname = parsed.hostname.rstrip(".").lower()
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            raise RuntimeError("Bitrix endpoint must not target localhost")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            if not address.is_global:
+                raise RuntimeError("Bitrix endpoint must use a public IP address")
+
+        return f"{endpoint}/"
 
     async def _post(self, method: str, params: dict, token: str) -> httpx.Response:
         url = f"{self.base_url}{method}.json"
@@ -57,7 +77,9 @@ class BitrixClient:
             response = await self._post(method, params, self.token)
             payload = response.json()
 
-        if response.is_error:
+        # Some Bitrix methods report application-level failures in a JSON
+        # payload even when the HTTP status itself is successful.
+        if response.is_error or payload.get("error"):
             raise BitrixApiError(response.status_code, payload)
 
         return payload

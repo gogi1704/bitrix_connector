@@ -100,53 +100,61 @@ class MessageRouter:
             return {"result": "ignored", "reason": "chat_id or user is missing"}
 
         chat_id = str(chat_id)
-        if self.database.has_dialog(channel="max", external_chat_id=chat_id):
+        existing_dialog = self.database.get_dialog(channel="max", external_chat_id=chat_id)
+        if existing_dialog and existing_dialog["welcome_sent"]:
             return {"result": "already_started"}
 
         user_name = self._safe_name(user.get("name"))
         timestamp = int(update.get("timestamp") or time.time())
         if timestamp > 10_000_000_000:
             timestamp //= 1000
-        result = await BitrixClient().call(
-            "imconnector.send.messages",
-            {
-                "CONNECTOR": Config.MAX_CONNECTOR_ID,
-                "LINE": int(Config.BITRIX_OPENLINE_ID),
-                "MESSAGES": [
-                    {
-                        "user": {"id": f"max-{user_id}", "name": user_name},
-                        "message": {
-                            "id": f"max-start-{uuid4()}",
-                            "date": timestamp,
-                            "text": BITRIX_DIALOG_STARTED_TEXT,
-                        },
-                        "chat": {
-                            "id": chat_id,
-                            "name": f"MAX: {user_name}",
-                            "url": "https://max.ru",
-                        },
-                    }
-                ],
-            },
-        )
-        item = result.get("result", {}).get("DATA", {}).get("RESULT", [{}])[0]
-        session = item.get("session") or {}
-        dialog_id = self.database.upsert_dialog(
-            channel="max",
-            external_chat_id=chat_id,
-            external_user_id=str(user_id),
-            external_user_name=user_name,
-            bitrix_chat_id=session.get("CHAT_ID"),
-            bitrix_session_id=session.get("ID"),
-            line_id=int(Config.BITRIX_OPENLINE_ID),
-        )
-        self.database.save_message(
-            dialog_id=dialog_id,
-            direction="max_to_bitrix",
-            text=BITRIX_DIALOG_STARTED_TEXT,
-            external_message_id=f"max-start-{chat_id}",
-        )
+        result = None
+        if existing_dialog:
+            dialog_id = int(existing_dialog["id"])
+        else:
+            start_message_id = f"max-start-{chat_id}"
+            result = await BitrixClient().call(
+                "imconnector.send.messages",
+                {
+                    "CONNECTOR": Config.MAX_CONNECTOR_ID,
+                    "LINE": int(Config.BITRIX_OPENLINE_ID),
+                    "MESSAGES": [
+                        {
+                            "user": {"id": f"max-{user_id}", "name": user_name},
+                            "message": {
+                                "id": start_message_id,
+                                "date": timestamp,
+                                "text": BITRIX_DIALOG_STARTED_TEXT,
+                            },
+                            "chat": {
+                                "id": chat_id,
+                                "name": f"MAX: {user_name}",
+                                "url": "https://max.ru",
+                            },
+                        }
+                    ],
+                },
+            )
+            result_items = result.get("result", {}).get("DATA", {}).get("RESULT") or [{}]
+            session = (result_items[0].get("session") or {}) if result_items else {}
+            dialog_id = self.database.upsert_dialog(
+                channel="max",
+                external_chat_id=chat_id,
+                external_user_id=str(user_id),
+                external_user_name=user_name,
+                bitrix_chat_id=session.get("CHAT_ID"),
+                bitrix_session_id=session.get("ID"),
+                line_id=int(Config.BITRIX_OPENLINE_ID),
+            )
+            self.database.save_message(
+                dialog_id=dialog_id,
+                direction="max_to_bitrix",
+                text=BITRIX_DIALOG_STARTED_TEXT,
+                external_message_id=start_message_id,
+            )
+
         await MaxClient().send_message(int(chat_id), MAX_WELCOME_TEXT)
+        self.database.mark_welcome_sent(dialog_id)
         return {"result": "started", "bitrix": result}
 
     async def from_bitrix(self, form: dict) -> None:

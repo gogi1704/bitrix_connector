@@ -1,11 +1,13 @@
+import hashlib
 import json
 import secrets
 import time
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from app.config import Config, DATA_DIR
 from app.services.bitrix_client import BitrixApiError, BitrixClient
+from app.services.max_client import MaxClient
 from app.services.oauth import OAuthService
 from app.storage.database import MessageDatabase
 
@@ -13,6 +15,19 @@ router = APIRouter(prefix="/bitrix", tags=["Bitrix"])
 
 TEST_CONNECTOR_ID = "bitrix_connector_test"
 TEST_CONNECTOR_ICON = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%2F%3E"
+
+
+def require_admin_token(request: Request) -> None:
+    """Protect endpoints that mutate or expose connector configuration."""
+    expected_token = Config.CONNECTOR_ADMIN_TOKEN or OAuthService().load().get(
+        "application_token"
+    )
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Connector admin token is not configured")
+
+    received_token = request.headers.get("X-Connector-Admin-Token", "")
+    if not secrets.compare_digest(expected_token, received_token):
+        raise HTTPException(status_code=403, detail="Invalid connector admin token")
 
 
 def get_auth_data(form: dict) -> dict:
@@ -37,10 +52,14 @@ async def install(request: Request):
     if not auth.get("access_token") or not auth.get("refresh_token"):
         raise HTTPException(status_code=400, detail="Bitrix OAuth auth data is required")
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(DATA_DIR / "install.json", "w", encoding="utf-8") as f:
-        json.dump({"auth": auth}, f, ensure_ascii=False, indent=4)
+    expected_token = Config.BITRIX_APPLICATION_TOKEN or OAuthService().load().get(
+        "application_token"
+    )
+    received_token = str(auth.get("application_token", ""))
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Bitrix application token is not configured")
+    if not secrets.compare_digest(expected_token, received_token):
+        raise HTTPException(status_code=403, detail="Invalid Bitrix application token")
 
     # Bitrix sends OAuth credentials in the installation form. Store them in
     # the same place used by BitrixClient so calls work immediately after install.
@@ -49,13 +68,13 @@ async def install(request: Request):
     return {"result": "ok"}
 
 
-@router.get("/test/outbound")
+@router.get("/test/outbound", dependencies=[Depends(require_admin_token)])
 async def test_outbound():
     """Verify that this app can call Bitrix24 REST API."""
     return await BitrixClient().call("app.info")
 
 
-@router.post("/test/bind")
+@router.post("/test/bind", dependencies=[Depends(require_admin_token)])
 async def bind_test_event():
     """Register a harmless ONAPPTEST event handler in Bitrix24."""
     if not Config.PUBLIC_BASE_URL:
@@ -69,7 +88,7 @@ async def bind_test_event():
     return {"handler": handler, "bitrix": result}
 
 
-@router.post("/test/trigger")
+@router.post("/test/trigger", dependencies=[Depends(require_admin_token)])
 async def trigger_test_event():
     """Ask Bitrix24 to send the registered ONAPPTEST callback."""
     return await BitrixClient().call("event.test", {"source": "bitrix_connector"})
@@ -80,10 +99,14 @@ async def receive_event(request: Request):
     """Receive and record a Bitrix24 event without retaining OAuth secrets."""
     form = dict(await request.form())
     auth = get_auth_data(form)
-    expected_token = OAuthService().load().get("application_token") or Config.BITRIX_APPLICATION_TOKEN
+    expected_token = Config.BITRIX_APPLICATION_TOKEN or OAuthService().load().get(
+        "application_token"
+    )
     received_token = auth.get("application_token")
 
-    if expected_token and not secrets.compare_digest(str(expected_token), str(received_token)):
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Bitrix application token is not configured")
+    if not secrets.compare_digest(str(expected_token), str(received_token or "")):
         raise HTTPException(status_code=403, detail="Invalid Bitrix application token")
 
     event = {
@@ -98,7 +121,10 @@ async def receive_event(request: Request):
         form.get("event", "").upper() == "ONIMCONNECTORMESSAGEADD"
         and form.get("data[CONNECTOR]") == Config.MAX_CONNECTOR_ID
     ):
-        message_id = form.get("data[MESSAGES][0][im][message_id]", "")
+        message_id = form.get("data[MESSAGES][0][im][message_id]")
+        if not message_id:
+            canonical_data = json.dumps(event["data"], ensure_ascii=False, sort_keys=True)
+            message_id = hashlib.sha256(canonical_data.encode("utf-8")).hexdigest()
         MessageDatabase().enqueue(
             job_type="bitrix_operator_message",
             payload=form,
@@ -108,7 +134,7 @@ async def receive_event(request: Request):
     return {"result": "received", "event": event["event"]}
 
 
-@router.post("/openlines/test")
+@router.post("/openlines/test", dependencies=[Depends(require_admin_token)])
 async def send_test_openline_message(
     line_id: int | None = None,
     message: str = "Здравствуйте! Это тестовое сообщение от клиента 777.",
@@ -180,13 +206,13 @@ async def send_test_openline_message(
     return {"line_id": line_id, "client_id": "777", "bitrix": sent}
 
 
-@router.get("/openlines")
+@router.get("/openlines", dependencies=[Depends(require_admin_token)])
 async def list_openlines():
     """Return Open Lines available to the installed Bitrix24 application."""
     return await BitrixClient().call("imopenlines.config.list.get")
 
 
-@router.post("/openlines/test/bind")
+@router.post("/openlines/test/bind", dependencies=[Depends(require_admin_token)])
 async def bind_openline_message_event():
     """Subscribe to messages sent by a Bitrix24 operator into the connector."""
     if not Config.PUBLIC_BASE_URL:
@@ -234,13 +260,13 @@ async def bind_openline_message_event():
     return {"handler": handler, "bitrix": result, "removed_stale": stale_handlers}
 
 
-@router.get("/openlines/test/handlers")
+@router.get("/openlines/test/handlers", dependencies=[Depends(require_admin_token)])
 async def list_openline_event_handlers():
     """Show registered Bitrix24 handlers for diagnosing connector callbacks."""
     return await BitrixClient().call("event.get")
 
 
-@router.post("/max/setup")
+@router.post("/max/setup", dependencies=[Depends(require_admin_token)])
 async def setup_max_connector():
     """Connect the MAX bot webhook and its custom connector to the Open Line."""
     if not Config.PUBLIC_BASE_URL:

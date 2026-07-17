@@ -10,10 +10,12 @@ router = APIRouter(prefix="/max", tags=["MAX"])
 @router.post("/webhook")
 async def receive_max_webhook(request: Request):
     """Forward incoming MAX messages to the configured Bitrix24 Open Line."""
-    if Config.MAX_WEBHOOK_SECRET:
-        received_secret = request.headers.get("X-Max-Bot-Api-Secret", "")
-        if not secrets.compare_digest(Config.MAX_WEBHOOK_SECRET, received_secret):
-            raise HTTPException(status_code=403, detail="Invalid MAX webhook secret")
+    if not Config.MAX_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="MAX webhook secret is not configured")
+
+    received_secret = request.headers.get("X-Max-Bot-Api-Secret", "")
+    if not secrets.compare_digest(Config.MAX_WEBHOOK_SECRET, received_secret):
+        raise HTTPException(status_code=403, detail="Invalid MAX webhook secret")
 
     update = await request.json()
     update_type = update.get("update_type")

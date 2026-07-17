@@ -1,5 +1,6 @@
 import json
-from pathlib import Path
+import os
+import tempfile
 
 from app.config import DATA_DIR
 
@@ -11,15 +12,20 @@ class OAuthService:
 
     def save(self, data: dict):
 
-        self.STORAGE.parent.mkdir(exist_ok=True)
-
-        with open(self.STORAGE, "w", encoding="utf8") as f:
-            json.dump(
-                data,
-                f,
-                indent=4,
-                ensure_ascii=False
-            )
+        self.STORAGE.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_path = tempfile.mkstemp(
+            dir=self.STORAGE.parent,
+            prefix=".oauth-",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf8") as file:
+                json.dump(data, file, indent=4, ensure_ascii=False)
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, self.STORAGE)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
 
     def load(self):
 

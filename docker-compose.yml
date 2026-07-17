@@ -1,13 +1,14 @@
-name: bitrix-max-connector
-
 services:
   connector:
     build: .
     env_file: .env
+    environment:
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
     ports:
       - "127.0.0.1:${CONNECTOR_HOST_PORT:-8001}:8000"
     volumes:
       - ./storage:/app/storage
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     restart: unless-stopped
     networks:
       - connector_internal
