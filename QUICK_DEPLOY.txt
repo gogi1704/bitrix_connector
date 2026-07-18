@@ -181,7 +181,10 @@ curl https://chelovecbitmax.ru/health
 10. НАСТРОИТЬ BITRIX И MAX
 --------------------------
 
-Локальному приложению Bitrix24 дать права imopenlines и imconnector.
+Локальному приложению Bitrix24 дать права:
+imopenlines, imconnector, im, disk.
+
+Права im и disk нужны для передачи файлов из Bitrix24 в MAX.
 
 В настройках приложения указать обработчик установки:
 

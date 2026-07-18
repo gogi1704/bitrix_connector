@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import secrets
 import time
 from uuid import uuid4
@@ -8,10 +9,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.config import Config, DATA_DIR
 from app.services.bitrix_client import BitrixApiError, BitrixClient
 from app.services.max_client import MaxClient
+from app.services.media import attachment_field_names
 from app.services.oauth import OAuthService
 from app.storage.database import MessageDatabase
 
 router = APIRouter(prefix="/bitrix", tags=["Bitrix"])
+logger = logging.getLogger(__name__)
 
 TEST_CONNECTOR_ID = "bitrix_connector_test"
 TEST_CONNECTOR_ICON = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%2F%3E"
@@ -109,10 +112,17 @@ async def receive_event(request: Request):
     if not secrets.compare_digest(str(expected_token), str(received_token or "")):
         raise HTTPException(status_code=403, detail="Invalid Bitrix application token")
 
+    media_fields = attachment_field_names(form)
     event = {
         "event": form.get("event"),
-        "data": {key: value for key, value in form.items() if not key.startswith("auth[")},
+        "data": {
+            key: "<redacted-media-value>" if key in media_fields else value
+            for key, value in form.items()
+            if not key.startswith("auth[")
+        },
     }
+    if media_fields:
+        logger.info("Bitrix media field names: %s", media_fields)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(DATA_DIR / "events.jsonl", "a", encoding="utf-8") as file:
         file.write(json.dumps(event, ensure_ascii=False) + "\n")

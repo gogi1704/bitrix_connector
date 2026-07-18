@@ -270,7 +270,11 @@ class MessageDatabase:
     def complete_job(self, job_id: int) -> None:
         with self._connect() as connection:
             connection.execute(
-                "UPDATE jobs SET state='completed', updated_at=CURRENT_TIMESTAMP WHERE id = ?",
+                """
+                UPDATE jobs
+                SET state='completed', payload_json='{}', updated_at=CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
                 (job_id,),
             )
 
@@ -281,10 +285,14 @@ class MessageDatabase:
             connection.execute(
                 """
                 UPDATE jobs
-                SET state=?, available_at=?, last_error=?, updated_at=CURRENT_TIMESTAMP
+                SET state=?,
+                    available_at=?,
+                    last_error=?,
+                    payload_json=CASE WHEN ? = 'failed' THEN '{}' ELSE payload_json END,
+                    updated_at=CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (state, time.time() + delay, error[:1000], job_id),
+                (state, time.time() + delay, error[:1000], state, job_id),
             )
 
     def recover_processing_jobs(self) -> None:

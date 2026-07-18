@@ -46,3 +46,5 @@ class Config:
     )
     JOB_MAX_ATTEMPTS = int(os.getenv("JOB_MAX_ATTEMPTS", 8))
     JOB_POLL_SECONDS = float(os.getenv("JOB_POLL_SECONDS", 0.5))
+    MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", 50 * 1024 * 1024))
+    MEDIA_DOWNLOAD_TIMEOUT = float(os.getenv("MEDIA_DOWNLOAD_TIMEOUT", 120))

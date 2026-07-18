@@ -8,6 +8,13 @@ from app.config import Config
 from app.resources.messages import BITRIX_DIALOG_STARTED_TEXT, MAX_WELCOME_TEXT
 from app.services.bitrix_client import BitrixClient
 from app.services.max_client import MaxClient
+from app.services.media import (
+    attachment_metadata,
+    bitrix_api_file,
+    bitrix_file_ids_from_form,
+    bitrix_files_from_form,
+    max_attachments_to_bitrix_files,
+)
 from app.services.user_profiles import UserProfileError, UserProfileService
 from app.storage.database import MessageDatabase
 
@@ -80,6 +87,14 @@ class MessageRouter:
 
         max_message_id = str(message.get("id") or uuid4())
         user_name = self._safe_name(sender.get("name"))
+        bitrix_files = max_attachments_to_bitrix_files(attachments)
+        message_payload = {"id": f"max-{max_message_id}", "date": timestamp}
+        if text:
+            message_payload["text"] = text
+        if bitrix_files:
+            message_payload["files"] = bitrix_files
+        if not text and not bitrix_files:
+            message_payload["text"] = "Attachment from MAX could not be transferred"
         result = await BitrixClient().call(
             "imconnector.send.messages",
             {
@@ -88,11 +103,7 @@ class MessageRouter:
                 "MESSAGES": [
                     {
                         "user": {"id": f"max-{sender_id}", "name": user_name},
-                        "message": {
-                            "id": f"max-{max_message_id}",
-                            "date": timestamp,
-                            "text": text or "📎 Вложение из MAX",
-                        },
+                        "message": message_payload,
                         "chat": {
                             "id": str(chat_id),
                             "name": f"MAX: {user_name}",
@@ -119,7 +130,7 @@ class MessageRouter:
             direction="max_to_bitrix",
             text=text,
             external_message_id=max_message_id,
-            media=attachments,
+            media=attachment_metadata(attachments),
         )
         return {"result": "forwarded", "bitrix": result}
 
@@ -193,11 +204,13 @@ class MessageRouter:
         """Forward an operator reply received from Bitrix24 to MAX."""
         chat_id = form.get("data[MESSAGES][0][chat][id]")
         raw_text = form.get("data[MESSAGES][0][message][text]", "")
+        files = bitrix_files_from_form(form)
+        file_ids = bitrix_file_ids_from_form(form)
         bitrix_message_id = form.get("data[MESSAGES][0][im][message_id]")
-        if not chat_id or not raw_text:
+        if not chat_id or (not raw_text and not files and not file_ids):
             return
 
-        command = self.extract_operator_command(raw_text)
+        command = self.extract_operator_command(raw_text) if raw_text else None
         if command:
             await self._handle_operator_command(
                 command=command,
@@ -206,8 +219,25 @@ class MessageRouter:
             )
             return
 
-        text = self.bitrix_to_max_text(raw_text)
-        await MaxClient().send_message(int(chat_id), text)
+        if not files:
+            for file_id in file_ids:
+                response = await BitrixClient().call("disk.file.get", {"id": file_id})
+                resolved_file = bitrix_api_file(response.get("result") or {})
+                if resolved_file:
+                    files.append(resolved_file)
+
+        text = self.bitrix_to_max_text(raw_text) if raw_text else ""
+        max_client = MaxClient()
+        if files:
+            for index, file in enumerate(files):
+                await max_client.send_remote_file(
+                    int(chat_id),
+                    url=str(file["url"]),
+                    name=file.get("name"),
+                    text=text if index == 0 and text else None,
+                )
+        else:
+            await max_client.send_message(int(chat_id), text)
         dialog_id = self.database.upsert_dialog(
             channel="max",
             external_chat_id=str(chat_id),
@@ -218,6 +248,7 @@ class MessageRouter:
             direction="bitrix_to_max",
             text=text,
             bitrix_message_id=str(bitrix_message_id) if bitrix_message_id else None,
+            media=attachment_metadata(files),
         )
 
     async def _handle_operator_command(

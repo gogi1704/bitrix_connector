@@ -11,7 +11,15 @@ from app.config import Config
 from app.routes.bitrix import install, require_admin_token
 from app.routes.max import receive_max_webhook
 from app.services.bitrix_client import BitrixApiError, BitrixClient
+from app.services.max_client import MaxClient
 from app.services.message_router import MessageRouter
+from app.services.media import (
+    attachment_metadata,
+    bitrix_api_file,
+    bitrix_file_ids_from_form,
+    bitrix_files_from_form,
+    max_attachments_to_bitrix_files,
+)
 from app.services.user_profiles import UserProfileError, UserProfileService
 from app.storage.database import MessageDatabase
 
@@ -187,6 +195,21 @@ class DatabaseTests(unittest.TestCase):
         dialog = migrated_database.get_dialog(channel="max", external_chat_id="42")
         self.assertEqual(dialog["welcome_sent"], 1)
 
+    def test_completed_job_payload_is_removed(self):
+        self.database.enqueue(
+            job_type="max_update",
+            payload={"attachment": {"url": "https://private", "token": "secret"}},
+            dedupe_key="media-job",
+        )
+        job = self.database.claim_job()
+        self.database.complete_job(job["id"])
+        with self.database._connect() as connection:
+            row = connection.execute(
+                "SELECT state, payload_json FROM jobs WHERE id = ?", (job["id"],)
+            ).fetchone()
+        self.assertEqual(row["state"], "completed")
+        self.assertEqual(row["payload_json"], "{}")
+
 
 class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -315,6 +338,66 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
             42, "👤 Manager\n\nHello"
         )
 
+    async def test_max_image_is_forwarded_to_bitrix_as_file(self):
+        router = MessageRouter()
+        update = {
+            "chat_id": 42,
+            "timestamp": 1_700_000_000,
+            "message": {
+                "id": "m1",
+                "sender": {"user_id": 7, "name": "Test User"},
+                "body": {
+                    "attachments": [
+                        {
+                            "type": "image",
+                            "payload": {
+                                "url": "https://cdn.example.org/photo.jpg",
+                                "token": "must-not-be-stored",
+                            },
+                        }
+                    ]
+                },
+            },
+        }
+        with patch("app.services.message_router.BitrixClient") as bitrix_client:
+            bitrix_client.return_value.call = AsyncMock(
+                return_value={"result": {"DATA": {"RESULT": [{}]}}}
+            )
+            await router.from_max(update)
+
+        payload = bitrix_client.return_value.call.await_args.args[1]
+        self.assertEqual(
+            payload["MESSAGES"][0]["message"]["files"][0]["url"],
+            "https://cdn.example.org/photo.jpg",
+        )
+        connection = sqlite3.connect(MessageDatabase.PATH)
+        try:
+            stored_media = connection.execute("SELECT media_json FROM messages").fetchone()[0]
+        finally:
+            connection.close()
+        self.assertNotIn("cdn.example.org", stored_media)
+        self.assertNotIn("must-not-be-stored", stored_media)
+
+    async def test_bitrix_file_without_text_is_sent_to_max(self):
+        router = MessageRouter()
+        form = {
+            "data[MESSAGES][0][chat][id]": "42",
+            "data[MESSAGES][0][im][message_id]": "102",
+            "data[MESSAGES][0][message][files][0][url]": "https://portal.example/file.pdf",
+            "data[MESSAGES][0][message][files][0][name]": "result.pdf",
+        }
+        with patch("app.services.message_router.MaxClient") as max_client:
+            max_client.return_value.send_remote_file = AsyncMock(return_value={"ok": True})
+            await router.from_bitrix(form)
+
+        max_client.return_value.send_remote_file.assert_awaited_once_with(
+            42,
+            url="https://portal.example/file.pdf",
+            name="result.pdf",
+            text=None,
+        )
+        max_client.return_value.send_message.assert_not_called()
+
     async def test_anketa_reports_profile_not_found(self):
         router = MessageRouter()
         router.database.upsert_dialog(
@@ -423,6 +506,109 @@ class UserProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         formatted = service.format_profile(profile)
         self.assertIn("Пол: Мужчина", formatted)
         self.assertIn("Возраст: 35", formatted)
+
+
+class MediaParsingTests(unittest.TestCase):
+    def test_media_helpers_do_not_persist_urls_or_tokens(self):
+        attachments = [
+            {
+                "type": "file",
+                "payload": {
+                    "url": "https://cdn.example/result.pdf",
+                    "token": "secret-token",
+                    "name": "result.pdf",
+                    "size": 123,
+                },
+            }
+        ]
+        self.assertEqual(
+            max_attachments_to_bitrix_files(attachments),
+            [{"url": "https://cdn.example/result.pdf", "name": "result.pdf"}],
+        )
+        metadata = attachment_metadata(attachments)
+        self.assertEqual(metadata[0]["name"], "result.pdf")
+        self.assertNotIn("url", metadata[0])
+        self.assertNotIn("token", metadata[0])
+
+    def test_flattened_bitrix_files_are_sorted(self):
+        form = {
+            "data[MESSAGES][0][message][files][1][url]": "https://portal/two.pdf",
+            "data[MESSAGES][0][message][files][1][name]": "two.pdf",
+            "data[MESSAGES][0][message][files][0][url]": "https://portal/one.jpg",
+            "data[MESSAGES][0][message][files][0][name]": "one.jpg",
+        }
+        self.assertEqual(
+            [item["name"] for item in bitrix_files_from_form(form)],
+            ["one.jpg", "two.pdf"],
+        )
+
+    def test_bitrix_disk_file_id_and_response_are_normalized(self):
+        form = {
+            "data[MESSAGES][0][message][params][FILE_ID][0]": "5255",
+        }
+        self.assertEqual(bitrix_file_ids_from_form(form), ["5255"])
+        self.assertEqual(
+            bitrix_api_file(
+                {
+                    "DOWNLOAD_URL": "https://portal/rest/download.json?token=signed",
+                    "NAME": "analysis.pdf",
+                    "SIZE": "1234",
+                }
+            ),
+            {
+                "url": "https://portal/rest/download.json?token=signed",
+                "name": "analysis.pdf",
+                "size": "1234",
+                "type": "file",
+            },
+        )
+
+    def test_declared_max_file_over_50_mb_is_not_forwarded(self):
+        attachments = [
+            {
+                "type": "file",
+                "payload": {
+                    "url": "https://cdn.example/large.zip",
+                    "size": Config.MEDIA_MAX_BYTES + 1,
+                },
+            }
+        ]
+        self.assertEqual(max_attachments_to_bitrix_files(attachments), [])
+
+
+class MaxMediaClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_temporary_file_is_deleted_after_sending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.pdf"
+            path.write_bytes(b"test")
+            client = MaxClient()
+            with (
+                patch(
+                    "app.services.max_client.download_to_temporary_file",
+                    new=AsyncMock(
+                        return_value=(path, "result.pdf", "application/pdf")
+                    ),
+                ),
+                patch.object(
+                    client,
+                    "_upload_file",
+                    new=AsyncMock(
+                        return_value={"type": "file", "payload": {"token": "t"}}
+                    ),
+                ),
+                patch.object(
+                    client,
+                    "send_message",
+                    new=AsyncMock(return_value={"ok": True}),
+                ),
+            ):
+                await client.send_remote_file(
+                    42,
+                    url="https://portal.example/result.pdf",
+                    name="result.pdf",
+                )
+
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":
