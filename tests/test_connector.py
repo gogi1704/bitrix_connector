@@ -665,6 +665,66 @@ class MaxMediaClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(path.exists())
 
+    async def test_video_uses_token_from_prepare_response_with_empty_upload_body(self):
+        client = MaxClient()
+        prepare = FakeResponse({
+            "url": "https://vu.okcdn.ru/upload.do?signed=1",
+            "token": "video-token",
+        })
+        prepare.content = b'{"url":"x"}'
+        prepare.raise_for_status = lambda: None
+        uploaded = FakeResponse({})
+        uploaded.content = b""
+        uploaded.raise_for_status = lambda: None
+        http_client = AsyncMock()
+        http_client.post = AsyncMock(side_effect=[prepare, uploaded])
+        context = AsyncMock()
+        context.__aenter__.return_value = http_client
+        context.__aexit__.return_value = False
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("app.services.max_client.httpx.AsyncClient", return_value=context),
+        ):
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"video")
+            attachment = await client._upload_file(path, "video.mp4", "video/mp4")
+
+        self.assertEqual(
+            attachment,
+            {"type": "video", "payload": {"token": "video-token"}},
+        )
+
+    async def test_image_accepts_photo_tokens_payload(self):
+        client = MaxClient()
+        prepare = FakeResponse({"url": "https://iu.oneme.ru/uploadImage?signed=1"})
+        prepare.content = b'{"url":"x"}'
+        prepare.raise_for_status = lambda: None
+        uploaded = FakeResponse({"photos": {"photo-id": {"token": "image-token"}}})
+        uploaded.content = b'{"photos":{"photo-id":{"token":"image-token"}}}'
+        uploaded.raise_for_status = lambda: None
+        http_client = AsyncMock()
+        http_client.post = AsyncMock(side_effect=[prepare, uploaded])
+        context = AsyncMock()
+        context.__aenter__.return_value = http_client
+        context.__aexit__.return_value = False
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("app.services.max_client.httpx.AsyncClient", return_value=context),
+        ):
+            path = Path(directory) / "photo.jpg"
+            path.write_bytes(b"photo")
+            attachment = await client._upload_file(path, "photo.jpg", "image/jpeg")
+
+        self.assertEqual(
+            attachment,
+            {
+                "type": "image",
+                "payload": {"photos": {"photo-id": {"token": "image-token"}}},
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,9 @@ truststore.inject_into_ssl()
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+# httpx includes full query strings in INFO records. Media upload URLs contain
+# short-lived credentials, so only transport warnings/errors may be logged.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 worker = JobWorker()
 
 

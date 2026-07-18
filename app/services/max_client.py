@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,9 @@ from app.services.media import (
     media_type,
     validate_remote_https_url,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MaxClient:
@@ -60,12 +64,29 @@ class MaxClient:
                     files={"data": (name, source, content_type)},
                 )
             uploaded.raise_for_status()
-            result = uploaded.json()
+            try:
+                result = uploaded.json() if uploaded.content else {}
+            except ValueError:
+                # Video/audio upload hosts may return an empty or non-JSON
+                # success body. Their reusable token is returned by /uploads.
+                result = {}
 
         token = result.get("token") or upload_data.get("token")
-        if not token:
-            raise MediaTransferError("MAX did not return a media token")
-        return {"type": kind, "payload": {"token": token}}
+        if token:
+            payload = {"token": token}
+        elif kind == "image" and result.get("photos"):
+            # Image upload responses can contain PhotoTokens instead of a
+            # single token. MAX expects that object unchanged in payload.
+            payload = result
+        elif kind == "image" and upload_data.get("photos"):
+            payload = {"photos": upload_data["photos"]}
+        else:
+            raise MediaTransferError(
+                f"MAX did not return attachment data for media type {kind}"
+            )
+
+        logger.info("MAX media upload completed: type=%s", kind)
+        return {"type": kind, "payload": payload}
 
     async def send_remote_file(
         self,
