@@ -573,6 +573,30 @@ class MediaParsingTests(unittest.TestCase):
             ["one.jpg", "two.pdf"],
         )
 
+    def test_real_bitrix_download_link_format_is_supported(self):
+        form = {
+            "data[MESSAGES][0][message][files][0][downloadLink]": "/rest/download.json?token=signed",
+            "data[MESSAGES][0][message][files][0][link]": "https://portal.example/preview",
+            "data[MESSAGES][0][message][files][0][mime]": "image/jpeg",
+            "data[MESSAGES][0][message][files][0][name]": "photo.jpg",
+            "data[MESSAGES][0][message][files][0][size]": "1234",
+            "data[MESSAGES][0][message][files][0][type]": "image",
+        }
+        with patch.object(Config, "BITRIX_DOMAIN", "portal.example"):
+            files = bitrix_files_from_form(form)
+        self.assertEqual(
+            files,
+            [
+                {
+                    "url": "https://portal.example/rest/download.json?token=signed",
+                    "mime": "image/jpeg",
+                    "name": "photo.jpg",
+                    "size": "1234",
+                    "type": "image",
+                }
+            ],
+        )
+
     def test_bitrix_disk_file_id_and_response_are_normalized(self):
         form = {
             "data[MESSAGES][0][message][params][FILE_ID][0]": "5255",

@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -101,10 +101,10 @@ def max_attachments_to_bitrix_files(attachments: list[dict]) -> list[dict]:
     return files
 
 
-def bitrix_files_from_form(form: dict) -> list[dict]:
+def bitrix_files_from_form(form: dict, bitrix_domain: str | None = None) -> list[dict]:
     """Read flattened files[] fields from an ONIMCONNECTORMESSAGEADD callback."""
     pattern = re.compile(
-        r"^data\[MESSAGES\]\[0\]\[message\]\[files\]\[(\d+)\]\[(url|urlDownload|DOWNLOAD_URL|name|size|type)\]$",
+        r"^data\[MESSAGES\]\[0\]\[message\]\[files\]\[(\d+)\]\[(url|urlDownload|DOWNLOAD_URL|downloadLink|link|name|size|sizef|type|mime)\]$",
         re.IGNORECASE,
     )
     indexed: dict[int, dict] = {}
@@ -112,10 +112,34 @@ def bitrix_files_from_form(form: dict) -> list[dict]:
         match = pattern.match(key)
         if match:
             field = match.group(2).lower()
-            if field in {"urldownload", "download_url"}:
+            if field in {"urldownload", "download_url", "downloadlink"}:
                 field = "url"
-            indexed.setdefault(int(match.group(1)), {})[field] = value
-    return [indexed[index] for index in sorted(indexed) if indexed[index].get("url")]
+            item = indexed.setdefault(int(match.group(1)), {})
+            # downloadLink/urlDownload is the original file. `link` may point
+            # to a preview page and is used only when no download URL exists.
+            if field == "link":
+                item.setdefault("url", value)
+            elif field == "sizef":
+                item.setdefault("formatted_size", value)
+            else:
+                item[field] = value
+
+    files = []
+    for index in sorted(indexed):
+        item = indexed[index]
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        if url.startswith("/"):
+            domain = (bitrix_domain or Config.BITRIX_DOMAIN).removeprefix(
+                "https://"
+            ).removeprefix("http://")
+            if not domain:
+                continue
+            url = urljoin(f"https://{domain}/", url)
+        item["url"] = url
+        files.append(item)
+    return files
 
 
 def bitrix_file_ids_from_form(form: dict) -> list[str]:

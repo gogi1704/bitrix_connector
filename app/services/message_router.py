@@ -204,7 +204,10 @@ class MessageRouter:
         """Forward an operator reply received from Bitrix24 to MAX."""
         chat_id = form.get("data[MESSAGES][0][chat][id]")
         raw_text = form.get("data[MESSAGES][0][message][text]", "")
-        files = bitrix_files_from_form(form)
+        files = bitrix_files_from_form(
+            form,
+            bitrix_domain=form.get("auth[domain]"),
+        )
         file_ids = bitrix_file_ids_from_form(form)
         bitrix_message_id = form.get("data[MESSAGES][0][im][message_id]")
         if not chat_id or (not raw_text and not files and not file_ids):
