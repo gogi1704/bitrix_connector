@@ -8,6 +8,7 @@ services:
       - "127.0.0.1:${CONNECTOR_HOST_PORT:-8001}:8000"
     volumes:
       - ./storage:/app/storage
+      - ${ANKETA_BOT_MAX_DOCS_DIR:-../anketa_bot_max/docs}:/external/anketa_bot_max/docs:ro
       - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     restart: unless-stopped
     networks:

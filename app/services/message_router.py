@@ -1,3 +1,5 @@
+import hashlib
+import logging
 import re
 import time
 from uuid import uuid4
@@ -6,7 +8,11 @@ from app.config import Config
 from app.resources.messages import BITRIX_DIALOG_STARTED_TEXT, MAX_WELCOME_TEXT
 from app.services.bitrix_client import BitrixClient
 from app.services.max_client import MaxClient
+from app.services.user_profiles import UserProfileError, UserProfileService
 from app.storage.database import MessageDatabase
+
+
+logger = logging.getLogger(__name__)
 
 
 class MessageRouter:
@@ -23,6 +29,32 @@ class MessageRouter:
         text = re.sub(r"\[br\]", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"\[/?(?:b|i|u|s)\]", "", text, flags=re.IGNORECASE)
         return text.strip()
+
+    @staticmethod
+    def extract_operator_command(text: str) -> str | None:
+        """Extract a leading slash command from Bitrix operator BBCode."""
+        text = text or ""
+        text = re.sub(
+            r"^\s*\[b\].+?:\[/b\]\s*\[br\]\s*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(r"\[br\]", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"\[/?(?:b|i|u|s)\]", "", text, flags=re.IGNORECASE).strip()
+        if text.startswith("/"):
+            return text.split(maxsplit=1)[0].casefold()
+
+        # Be tolerant of other Bitrix speaker markup: a command may remain on
+        # the final line after the operator name has been stripped partially.
+        text = re.sub(r"\[/?[^\]]+\]", "", text).strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines and lines[-1].startswith("/") and (
+            len(lines) == 1 or " ".join(lines[:-1]).endswith(":")
+        ):
+            return lines[-1].split(maxsplit=1)[0].casefold()
+        return None
 
     @staticmethod
     def _safe_name(value: str | None) -> str:
@@ -165,6 +197,15 @@ class MessageRouter:
         if not chat_id or not raw_text:
             return
 
+        command = self.extract_operator_command(raw_text)
+        if command:
+            await self._handle_operator_command(
+                command=command,
+                chat_id=str(chat_id),
+                source_message_id=str(bitrix_message_id or raw_text),
+            )
+            return
+
         text = self.bitrix_to_max_text(raw_text)
         await MaxClient().send_message(int(chat_id), text)
         dialog_id = self.database.upsert_dialog(
@@ -178,3 +219,105 @@ class MessageRouter:
             text=text,
             bitrix_message_id=str(bitrix_message_id) if bitrix_message_id else None,
         )
+
+    async def _handle_operator_command(
+        self,
+        *,
+        command: str,
+        chat_id: str,
+        source_message_id: str,
+    ) -> None:
+        response_message_id = "internal-command-" + hashlib.sha256(
+            f"{chat_id}:{source_message_id}".encode("utf-8")
+        ).hexdigest()[:24]
+        dialog = self.database.get_dialog(channel="max", external_chat_id=chat_id)
+        if dialog is None:
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=chat_id,
+                user_name="Пользователь MAX",
+                text="⚠️ Не удалось определить пользователя для служебной команды.",
+                message_id=response_message_id,
+            )
+            return
+
+        if command not in {"/anketa", "/anketa_refresh"}:
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=dialog.get("external_user_id") or chat_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=f"⚠️ Неизвестная служебная команда: {command}",
+                dialog_id=int(dialog["id"]),
+                message_id=response_message_id,
+            )
+            return
+
+        profile_service = UserProfileService(self.database)
+        user_id = dialog.get("external_user_id") or chat_id
+        try:
+            profile = await profile_service.get_profile(
+                user_id,
+                refresh=command == "/anketa_refresh",
+            )
+        except UserProfileError:
+            logger.exception("Could not load Google Sheets profile for MAX user %s", user_id)
+            response_text = (
+                "⚠️ Не удалось получить анкету. Повторите команду позже."
+            )
+        else:
+            response_text = (
+                profile_service.format_profile(profile)
+                if profile
+                else f"🔍 Анкета пользователя с ID {user_id} не найдена."
+            )
+
+        await self._send_internal_message(
+            chat_id=chat_id,
+            user_id=user_id,
+            user_name=dialog.get("external_user_name") or "Пользователь MAX",
+            text=response_text,
+            dialog_id=int(dialog["id"]),
+            message_id=response_message_id,
+        )
+
+    async def _send_internal_message(
+        self,
+        *,
+        chat_id: str,
+        user_id: str,
+        user_name: str,
+        text: str,
+        dialog_id: int | None = None,
+        message_id: str | None = None,
+    ) -> None:
+        """Show a service response in Bitrix without sending it to MAX."""
+        message_id = message_id or f"internal-{uuid4()}"
+        await BitrixClient().call(
+            "imconnector.send.messages",
+            {
+                "CONNECTOR": Config.MAX_CONNECTOR_ID,
+                "LINE": int(Config.BITRIX_OPENLINE_ID),
+                "MESSAGES": [
+                    {
+                        "user": {"id": f"max-{user_id}", "name": user_name},
+                        "message": {
+                            "id": message_id,
+                            "date": int(time.time()),
+                            "text": text,
+                        },
+                        "chat": {
+                            "id": chat_id,
+                            "name": f"MAX: {user_name}",
+                            "url": "https://max.ru",
+                        },
+                    }
+                ],
+            },
+        )
+        if dialog_id is not None:
+            self.database.save_message(
+                dialog_id=dialog_id,
+                direction="internal_to_bitrix",
+                text=text,
+                external_message_id=message_id,
+            )

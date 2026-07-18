@@ -34,5 +34,15 @@ class Config:
     MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
     MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")
     MAX_CONNECTOR_ID = os.getenv("MAX_CONNECTOR_ID", "max_bot_bridge")
+    ANAMNEZ_GOOGLE_CREDENTIALS = os.getenv("ANKETA_GOOGLE_CREDENTIALS", "")
+    AFTER_TESTS_GOOGLE_CREDENTIALS = os.getenv(
+        "AFTER_TESTS_GOOGLE_CREDENTIALS", ""
+    )
+    ANAMNEZ_SPREADSHEET_NAME = os.getenv(
+        "ANKETA_GOOGLE_SPREADSHEET_NAME", "anamnez_db_max"
+    )
+    AFTER_TESTS_SPREADSHEET_NAME = os.getenv(
+        "AFTER_TESTS_GOOGLE_SPREADSHEET_NAME", "after_tests_db"
+    )
     JOB_MAX_ATTEMPTS = int(os.getenv("JOB_MAX_ATTEMPTS", 8))
     JOB_POLL_SECONDS = float(os.getenv("JOB_POLL_SECONDS", 0.5))

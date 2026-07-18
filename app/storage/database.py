@@ -55,6 +55,14 @@ class MessageDatabase:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    external_user_id TEXT PRIMARY KEY,
+                    age INTEGER,
+                    weight TEXT,
+                    height TEXT,
+                    sex TEXT,
+                    source_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE INDEX IF NOT EXISTS messages_external_idx
                     ON messages(dialog_id, direction, external_message_id);
                 CREATE INDEX IF NOT EXISTS jobs_ready_idx ON jobs(state, available_at, id);
@@ -181,6 +189,39 @@ class MessageDatabase:
 
     def has_dialog(self, *, channel: str, external_chat_id: str) -> bool:
         return self.get_dialog(channel=channel, external_chat_id=external_chat_id) is not None
+
+    def get_user_profile(self, external_user_id: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM user_profiles WHERE external_user_id = ?",
+                (external_user_id,),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def upsert_user_profile(
+        self,
+        *,
+        external_user_id: str,
+        age: int | str | None,
+        weight: str | None,
+        height: str | None,
+        sex: str | None,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO user_profiles (
+                    external_user_id, age, weight, height, sex
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(external_user_id) DO UPDATE SET
+                    age=excluded.age,
+                    weight=excluded.weight,
+                    height=excluded.height,
+                    sex=excluded.sex,
+                    source_synced_at=CURRENT_TIMESTAMP
+                """,
+                (external_user_id, age, weight, height, sex),
+            )
 
     def enqueue(self, *, job_type: str, payload: dict, dedupe_key: str) -> bool:
         with self._connect() as connection:

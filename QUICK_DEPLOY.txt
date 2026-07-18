@@ -1,0 +1,268 @@
+BITRIX CONNECTOR — КОРОТКАЯ УСТАНОВКА НА СЕРВЕР
+================================================
+
+Предполагается:
+- сервер: root@213.148.9.40
+- домен: chelovecbitmax.ru
+- anketa_bot_max уже находится в /root/anketa_bot_max_web
+- Google-ключи уже лежат в /root/anketa_bot_max_web/docs
+
+
+1. ПОДКЛЮЧИТЬСЯ К СЕРВЕРУ
+-------------------------
+
+ssh root@213.148.9.40
+
+export DOCKER_API_VERSION=1.43
+
+
+2. СКАЧАТЬ ПРОЕКТ
+------------------
+
+cd /root
+
+git clone -b master https://github.com/gogi1704/bitrix_connector.git bitrix_connector
+
+cd /root/bitrix_connector
+
+mkdir -p storage
+chown -R 1000:1000 storage
+
+
+3. ПРОВЕРИТЬ GOOGLE-КЛЮЧИ ДРУГОГО БОТА
+---------------------------------------
+
+ls -l /root/anketa_bot_max_web/docs/anamnez-max-a04dd6899274.json
+ls -l /root/anketa_bot_max_web/docs/after-tests-db-e0cd34372c4a.json
+
+Если файлов нет — отправить их с Windows:
+
+scp C:\Users\zoral\OneDrive\Desktop\docker_instructions\anamnez-max-a04dd6899274.json root@213.148.9.40:/root/anketa_bot_max_web/docs/
+
+scp C:\Users\zoral\OneDrive\Desktop\docker_instructions\after-tests-db-e0cd34372c4a.json root@213.148.9.40:/root/anketa_bot_max_web/docs/
+
+Ограничить права:
+
+chown root:1000 /root/anketa_bot_max_web/docs/anamnez-max-a04dd6899274.json
+chown root:1000 /root/anketa_bot_max_web/docs/after-tests-db-e0cd34372c4a.json
+chmod 640 /root/anketa_bot_max_web/docs/anamnez-max-a04dd6899274.json
+chmod 640 /root/anketa_bot_max_web/docs/after-tests-db-e0cd34372c4a.json
+
+
+4. СОЗДАТЬ .env
+----------------
+
+cd /root/bitrix_connector
+
+cp .env.example .env
+nano .env
+
+Заполнить:
+
+APP_HOST=0.0.0.0
+APP_PORT=8000
+CONNECTOR_HOST_PORT=8001
+PUBLIC_BASE_URL=https://chelovecbitmax.ru
+
+CLIENT_ID=local.xxxxxxxxx
+CLIENT_SECRET=xxxxxxxxx
+BITRIX_DOMAIN=
+BITRIX_ACCESS_TOKEN=
+BITRIX_OPENLINE_ID=17
+BITRIX_APPLICATION_TOKEN=xxxxxxxxx
+CONNECTOR_ADMIN_TOKEN=xxxxxxxxx
+
+MAX_API_URL=https://platform-api2.max.ru
+MAX_BOT_TOKEN=xxxxxxxxx
+MAX_WEBHOOK_SECRET=xxxxxxxxx
+MAX_CONNECTOR_ID=max_bot_bridge
+
+ANKETA_GOOGLE_CREDENTIALS=/external/anketa_bot_max/docs/anamnez-max-a04dd6899274.json
+AFTER_TESTS_GOOGLE_CREDENTIALS=/external/anketa_bot_max/docs/after-tests-db-e0cd34372c4a.json
+ANKETA_GOOGLE_SPREADSHEET_NAME=anamnez_db_max
+AFTER_TESTS_GOOGLE_SPREADSHEET_NAME=after_tests_db
+
+JOB_MAX_ATTEMPTS=8
+JOB_POLL_SECONDS=0.5
+
+Сгенерировать отдельные секреты:
+
+openssl rand -hex 32
+
+chmod 600 /root/bitrix_connector/.env
+
+
+5. СОБРАТЬ ОБРАЗ
+-----------------
+
+cd /root/bitrix_connector
+
+docker build -t bitrix_connector_image .
+
+
+6. УДАЛИТЬ СТАРЫЙ КОНТЕЙНЕР
+---------------------------
+
+docker rm -f bitrix_connector 2>/dev/null || true
+
+
+7. ЗАПУСТИТЬ КОНТЕЙНЕР
+----------------------
+
+docker run -d \
+  --restart always \
+  --name bitrix_connector \
+  --env-file /root/bitrix_connector/.env \
+  -p 127.0.0.1:8001:8000 \
+  -e SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+  -e REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+  -v /root/bitrix_connector/storage:/app/storage \
+  -v /root/anketa_bot_max_web/docs:/external/anketa_bot_max/docs:ro \
+  -v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro \
+  bitrix_connector_image
+
+
+8. ПРОВЕРИТЬ КОНТЕЙНЕР
+----------------------
+
+docker ps
+
+docker logs --tail 100 bitrix_connector
+
+curl http://127.0.0.1:8001/health
+
+
+9. NGINX
+--------
+
+apt update
+apt install nginx certbot python3-certbot-nginx -y
+
+nano /etc/nginx/sites-available/bitrix-connector
+
+Вставить:
+
+server {
+    listen 80;
+    server_name chelovecbitmax.ru;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 60s;
+        proxy_read_timeout 60s;
+    }
+}
+
+Активировать:
+
+ln -sf /etc/nginx/sites-available/bitrix-connector /etc/nginx/sites-enabled/bitrix-connector
+
+nginx -t
+systemctl reload nginx
+
+Получить HTTPS-сертификат:
+
+certbot --nginx -d chelovecbitmax.ru
+
+Проверить:
+
+curl https://chelovecbitmax.ru/health
+
+
+10. НАСТРОИТЬ BITRIX И MAX
+--------------------------
+
+Локальному приложению Bitrix24 дать права imopenlines и imconnector.
+
+В настройках приложения указать обработчик установки:
+
+https://chelovecbitmax.ru/bitrix/install
+
+После этого переустановить приложение в Bitrix24.
+
+В терминале сервера указать тот же CONNECTOR_ADMIN_TOKEN, который записан в .env:
+
+export ADMIN_TOKEN='xxxxxxxxx'
+
+Подключить событие сообщений операторов:
+
+curl -X POST \
+  -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
+  https://chelovecbitmax.ru/bitrix/openlines/test/bind
+
+Подключить MAX-коннектор и webhook:
+
+curl -X POST \
+  -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
+  https://chelovecbitmax.ru/bitrix/max/setup
+
+Проверить обработчики:
+
+curl \
+  -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
+  https://chelovecbitmax.ru/bitrix/openlines/test/handlers
+
+
+11. ПРОВЕРИТЬ КОМАНДУ АНКЕТЫ
+----------------------------
+
+В открытой линии Bitrix написать:
+
+/anketa
+
+Команда пользователю MAX не отправляется.
+
+Принудительно повторить поиск в Google:
+
+/anketa_refresh
+
+
+12. ОБНОВЛЕНИЕ ПРОЕКТА
+----------------------
+
+cd /root/bitrix_connector
+
+git pull
+
+docker rm -f bitrix_connector
+
+docker build -t bitrix_connector_image .
+
+Повторить команду запуска из пункта 7.
+
+
+13. ПОЛЕЗНЫЕ КОМАНДЫ
+--------------------
+
+Логи:
+
+docker logs -f bitrix_connector
+
+Перезапуск:
+
+docker restart bitrix_connector
+
+Удалить контейнер:
+
+docker rm -f bitrix_connector
+
+Зайти внутрь контейнера:
+
+docker exec -it bitrix_connector bash
+
+Проверить Google-ключи внутри контейнера:
+
+docker exec bitrix_connector ls -l /external/anketa_bot_max/docs/
+
+Проверить очередь:
+
+curl https://chelovecbitmax.ru/health

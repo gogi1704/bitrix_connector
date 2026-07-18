@@ -1,0 +1,449 @@
+BITRIX CONNECTOR — ИНСТРУКЦИЯ ПО РАЗВЁРТЫВАНИЮ НА СЕРВЕРЕ
+==========================================================
+
+Инструкция рассчитана на Ubuntu Server 22.04 или 24.04.
+
+Исходные условия:
+- Папка проекта уже лежит в корне сервера: /bitrix_connector
+- Есть домен, который будет использоваться для приложения.
+- Домен этого бота: chelovecbitmax.ru.
+- На DNS-панели домена должна быть создана A-запись chelovecbitmax.ru, указывающая
+  на публичный IP-адрес сервера.
+- Команды выполняются от имени пользователя с правами sudo.
+
+1. ПОДГОТОВКА СЕРВЕРА
+---------------------
+
+Обновите систему и установите Nginx:
+
+  sudo apt update && sudo apt upgrade -y
+  sudo apt install -y nginx ufw
+
+Разрешите только SSH, HTTP и HTTPS:
+
+  sudo ufw allow OpenSSH
+  sudo ufw allow 'Nginx Full'
+  sudo ufw enable
+  sudo ufw status
+
+ВАЖНО: порт 8001 открывать наружу не нужно. Приложение будет доступно только
+локально, а Nginx будет принимать публичные HTTPS-запросы.
+
+2. УСТАНОВКА DOCKER И DOCKER COMPOSE
+------------------------------------
+
+Установите Docker из официального репозитория Docker:
+
+  sudo apt update
+  sudo apt install -y ca-certificates curl
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+  sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF
+  Types: deb
+  URIs: https://download.docker.com/linux/ubuntu
+  Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+  Components: stable
+  Architectures: $(dpkg --print-architecture)
+  Signed-By: /etc/apt/keyrings/docker.asc
+  EOF
+  sudo apt update
+  sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  sudo systemctl enable --now docker
+  sudo docker run --rm hello-world
+
+Необязательный шаг: чтобы не писать sudo перед Docker-командами, добавьте
+текущего пользователя в группу docker и переподключитесь по SSH:
+
+  sudo usermod -aG docker $USER
+
+3. НАСТРОЙКА ПРОЕКТА
+--------------------
+
+Перейдите в папку проекта и создайте файл с секретами:
+
+  cd /bitrix_connector
+  cp .env.example .env
+  nano .env
+
+Заполните как минимум следующие поля:
+
+  APP_HOST=0.0.0.0
+  APP_PORT=8000
+  CONNECTOR_HOST_PORT=8001
+  PUBLIC_BASE_URL=https://chelovecbitmax.ru
+
+  CLIENT_ID=local.xxxxxxxxx
+  CLIENT_SECRET=xxxxxxxxx
+  BITRIX_OPENLINE_ID=17
+  BITRIX_APPLICATION_TOKEN=xxxxxxxxx
+  CONNECTOR_ADMIN_TOKEN=отдельный_длинный_случайный_секрет
+
+  MAX_BOT_TOKEN=xxxxxxxxx
+  MAX_WEBHOOK_SECRET=длинный_случайный_секрет_без_пробелов
+  MAX_CONNECTOR_ID=max_bot_bridge
+
+  ANKETA_BOT_MAX_DOCS_DIR=/root/anketa_bot_max/docs
+  ANKETA_GOOGLE_CREDENTIALS=/external/anketa_bot_max/docs/anamnez-max-a04dd6899274.json
+  AFTER_TESTS_GOOGLE_CREDENTIALS=/external/anketa_bot_max/docs/after-tests-db-e0cd34372c4a.json
+  ANKETA_GOOGLE_SPREADSHEET_NAME=anamnez_db_max
+  AFTER_TESTS_GOOGLE_SPREADSHEET_NAME=after_tests_db
+
+Сгенерируйте отдельные секреты для MAX и административных маршрутов:
+
+  openssl rand -hex 32
+
+Ограничьте доступ к файлу:
+
+  chmod 600 .env
+
+Никогда не добавляйте .env в Git и не передавайте его содержимое другим людям.
+
+Для команды /anketa каталог docs из проекта anketa_bot_max подключается к
+контейнеру только для чтения. Коннектор использует существующие service-account
+JSON и не изменяет код или базы работающего anketa_bot_max.
+
+Когда менеджер отправляет в диалоге Bitrix команду /anketa, коннектор не
+пересылает её пользователю MAX. Если профиля ещё нет в connector.db, выполняется
+разовый поиск MAX ID в листах user_anketa и users_max двух Google-таблиц.
+Найденные рост, вес, возраст и пол сохраняются локально и публикуются в открытой
+линии. Команда /anketa_refresh принудительно повторяет поиск в Google.
+Остальные сообщения менеджера продолжают отправляться пользователю как обычно.
+Любое сообщение менеджера, начинающееся с символа /, считается служебной
+командой и в MAX не пересылается.
+
+4. NGINX И HTTPS-СЕРТИФИКАТ
+---------------------------
+
+Создайте конфигурацию Nginx:
+
+  sudo nano /etc/nginx/sites-available/bitrix-connector
+
+Вставьте конфигурацию. Она обслуживает только домен этого бота:
+
+server {
+    listen 80;
+    server_name chelovecbitmax.ru;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 60s;
+    }
+}
+
+Активируйте конфигурацию:
+
+ sudo ln -s /etc/nginx/sites-available/bitrix-connector /etc/nginx/sites-enabled/
+  sudo nginx -t
+  sudo systemctl reload nginx
+
+НЕ удаляйте конфигурацию другого бота и не изменяйте его файл в
+/etc/nginx/sites-available. Nginx одновременно обслуживает оба проекта на
+стандартных портах 80 и 443 и выбирает нужный сайт по имени домена.
+
+Почему проекты не пересекаются:
+- этот бот доступен Nginx только на 127.0.0.1:8001;
+- его Docker Compose-проект и внутренняя сеть имеют отдельные имена;
+- данные лежат только в /bitrix_connector/storage;
+- запросы к chelovecbitmax.ru попадут лишь в эту конфигурацию Nginx.
+
+Если порт 8001 уже занят, выберите свободный, например 8011: укажите его в
+CONNECTOR_HOST_PORT в .env и замените 8001 на 8011 в строке proxy_pass выше.
+Порты 80 и 443 менять не нужно: они общие для Nginx, а не для приложений.
+
+Установите доверенный HTTPS-сертификат Let's Encrypt:
+
+  sudo snap install --classic certbot
+  sudo ln -s /snap/bin/certbot /usr/bin/certbot
+  sudo certbot --nginx -d chelovecbitmax.ru
+
+Проверьте автоматическое продление сертификата:
+
+  sudo certbot renew --dry-run
+
+5. ЗАПУСК ПРИЛОЖЕНИЯ
+--------------------
+
+  cd /bitrix_connector
+  sudo docker-compose up --build -d
+  sudo docker compose ps
+  sudo docker compose logs -f connector
+
+Контейнер автоматически перезапустится после перезагрузки сервера или сбоя.
+Диалоги, сообщения и очередь лежат в файле:
+
+  /bitrix_connector/storage/connector.db
+
+6. ПРОВЕРКА РАБОТЫ
+------------------
+
+Проверка непосредственно на сервере:
+
+  curl http://127.0.0.1:8001/health
+
+Проверка через домен:
+
+  curl https://chelovecbitmax.ru/health
+
+В ответ должен прийти JSON со статусом "ok" и состоянием очереди.
+
+7. ПОДКЛЮЧЕНИЕ BITRIX24 И MAX К НОВОМУ ДОМЕНУ
+----------------------------------------------
+
+После перехода с ngrok на сервер нужно обновить все адреса обработчиков.
+
+1) В настройках локального приложения Bitrix24 укажите адрес установки:
+
+  https://chelovecbitmax.ru/bitrix/install
+
+Если изменялись права приложения или адрес установки — переустановите
+локальное приложение. У приложения должны быть права Открытых линий:
+imopenlines и imconnector.
+
+2) Зарегистрируйте обработчик событий Bitrix24. Команда также удалит старые
+адреса ngrok для ответов операторов:
+
+  curl -X POST \
+    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/openlines/test/bind
+
+3) Подключите MAX-бота и его webhook к новому адресу:
+
+  curl -X POST \
+    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/max/setup
+
+4) Убедитесь, что в списке обработчиков присутствует только актуальный домен:
+
+  curl -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/openlines/test/handlers
+
+8. ПОВСЕДНЕВНЫЕ КОМАНДЫ
+-----------------------
+
+Посмотреть логи:
+
+  cd /bitrix_connector
+  sudo docker compose logs -f connector
+
+Проверить состояние очереди:
+
+  curl https://chelovecbitmax.ru/health
+
+Перезапустить приложение после изменения .env или кода:
+
+  cd /bitrix_connector
+  sudo docker compose up --build -d
+
+Обновить проект из Git:
+
+  cd /bitrix_connector
+  git pull
+  sudo docker compose up --build -d
+
+9. РЕЗЕРВНОЕ КОПИРОВАНИЕ
+-------------------------
+
+Регулярно сохраняйте как минимум:
+
+  /bitrix_connector/storage/connector.db
+  /bitrix_connector/.env
+
+Чтобы получить согласованную копию SQLite, остановите контейнер на время
+копирования:
+
+  cd /bitrix_connector
+  sudo docker compose stop connector
+  sudo mkdir -p /root/backups
+  sudo cp storage/connector.db /root/backups/connector-$(date +%F).db
+  sudo docker compose start connector
+
+10. ЕСЛИ ЧТО-ТО НЕ РАБОТАЕТ
+---------------------------
+
+Сообщения остаются в очереди или webhook возвращает ошибку:
+
+  sudo docker compose logs --tail=200 connector
+  curl https://chelovecbitmax.ru/health
+
+MAX не присылает сообщения:
+- Убедитесь, что PUBLIC_BASE_URL начинается с https://.
+- Проверьте, что сертификат домена действителен.
+- После смены домена, токена или секрета снова вызовите:
+  curl -X POST \
+    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/max/setup
+
+Bitrix24 не присылает ответы операторов:
+- Проверьте список обработчиков:
+  curl -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/openlines/test/handlers
+- В нём должно быть событие ONIMCONNECTORMESSAGEADD с адресом:
+  https://chelovecbitmax.ru/bitrix/events
+- Повторно привяжите обработчик:
+  curl -X POST \
+    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/openlines/test/bind
+
+ОГРАНИЧЕНИЕ ТЕКУЩЕЙ ВЕРСИИ
+--------------------------
+
+Запускайте один контейнер connector. SQLite-очередь рассчитана на один
+серверный инстанс. Если в будущем потребуется несколько серверов или высокая
+параллельная нагрузка, перенесите очередь и хранилище диалогов на PostgreSQL,
+а фоновые задачи — в Redis или RabbitMQ.
+АКТУАЛЬНОЕ ДОПОЛНЕНИЕ ДЛЯ СЕРВЕРА MATTIE (2026-07-16)
+=====================================================
+
+Этот раздел имеет приоритет над более ранними фрагментами инструкции ниже.
+Рабочая установка находится в /root/bitrix_connector и использует домен
+chelovecbitmax.ru.
+
+1. ИЗОЛЯЦИЯ ОТ СТАРОГО БОТА
+---------------------------
+
+Старый бот остаётся без изменений: он обслуживается Nginx на своём домене и
+занимает 127.0.0.1:8000. Новый коннектор опубликован только на
+127.0.0.1:8001 (внутри контейнера — порт 8000). Порт 8001 не открывают во
+внешний интернет: публичный HTTPS-трафик принимает Nginx.
+
+В docker-compose.yml обязательно должны быть эти строки:
+
+  services:
+    connector:
+      ports:
+        - "127.0.0.1:${CONNECTOR_HOST_PORT:-8001}:8000"
+      restart: unless-stopped
+
+2. SQLITE: ПРАВА НА КАТАЛОГ ДАННЫХ
+----------------------------------
+
+Контейнер запускается не от root. Перед первым стартом или после копирования
+проекта на сервер выполните:
+
+  cd /root/bitrix_connector
+  sudo mkdir -p storage
+  sudo chown -R 1000:1000 storage
+  sudo chmod -R u+rwX storage
+
+Если этого не сделать, приложение выдаст sqlite3.OperationalError: unable to
+open database file, будет перезапускаться, а Nginx вернёт 502.
+
+3. COMPOSE V1 НА ТЕКУЩЕМ СЕРВЕРЕ
+--------------------------------
+
+На сервере установлена версия docker-compose 1.29.2. Используйте команды через
+дефис:
+
+  sudo docker-compose ps
+  sudo docker-compose logs --tail=200 connector
+  sudo docker-compose up --build -d
+
+В docker-compose.yml нельзя добавлять верхнеуровневий ключ name:, потому что
+Compose v1 его не поддерживает.
+
+Если при пересоздании контейнера Compose v1 пишет KeyError: 'ContainerConfig',
+пересоздайте только данный проект:
+
+  cd /root/bitrix_connector
+  sudo docker-compose down
+  sudo docker-compose up --build -d
+
+Не добавляйте -v к команде down: storage/connector.db должен сохраниться.
+Старый бот эта команда не затрагивает.
+
+4. ВХОДЯЩИЙ HTTPS ДЛЯ НОВОГО ДОМЕНА
+------------------------------------
+
+Используйте отдельный Nginx server block с server_name chelovecbitmax.ru и
+proxy_pass http://127.0.0.1:8001. Конфигурацию старого бота maxbot не меняйте.
+
+После появления DNS A-записи chelovecbitmax.ru на IP сервера SSL-сертификат
+можно выпустить так:
+
+  sudo certbot --nginx -d chelovecbitmax.ru
+  sudo certbot renew --dry-run
+
+Покупной сертификат другого домена для этого не подходит. Приватный ключ
+сертификата сайта никогда не кладут в Docker-контейнер.
+
+5. ИСХОДЯЩИЙ TLS К API MAX
+--------------------------
+
+Это не тот же сертификат, что HTTPS сертификат сайта. MAX API использует
+Russian Trusted Sub CA: хост Ubuntu ему доверяет, а стандартный Python slim
+образ может не доверять. Поэтому в Dockerfile устанавливаются ca-certificates,
+а docker-compose.yml использует CA-файл хоста только для чтения:
+
+  services:
+    connector:
+      environment:
+        SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - ./storage:/app/storage
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+
+Не используйте verify=False. После изменения compose-конфигурации:
+
+  cd /root/bitrix_connector
+  sudo docker-compose down
+  sudo docker-compose up -d
+
+Проверка из контейнера:
+
+  sudo docker-compose exec connector python -c "import httpx; print(httpx.get('https://platform-api2.max.ru', timeout=20).status_code)"
+
+Код 404 здесь означает успешное TLS-соединение: у API нет маршрута /.
+
+6. ПОРЯДОК ПРОВЕРКИ ПОСЛЕ РАЗВЁРТЫВАНИЯ
+---------------------------------------
+
+  cd /root/bitrix_connector
+  sudo docker-compose ps
+  curl http://127.0.0.1:8001/health
+  curl https://chelovecbitmax.ru/health
+  curl -X POST -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/openlines/test/bind
+  curl -X POST -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    https://chelovecbitmax.ru/bitrix/max/setup
+
+Ожидаемый health-ответ:
+
+  {"status":"ok","queue":{}}
+
+Обработчик Bitrix после bind использует:
+
+  https://chelovecbitmax.ru/bitrix/events
+
+Повторно вызывать bind без необходимости не нужно: он уже удаляет устаревший
+ngrok URL и регистрирует актуальный.
+
+7. УСТРАНЁННАЯ ОШИБКА НАСТРОЙКИ MAX
+-----------------------------------
+
+Маршрут /bitrix/max/setup использует MaxClient. Импорт
+"from app.services.max_client import MaxClient" добавлен в app/routes/bitrix.py.
+Без него маршрут отвечал HTTP 500 с NameError: MaxClient is not defined.
+
+8. РЕЗЕРВНАЯ КОПИЯ
+------------------
+
+Сохраняйте отдельно от репозитория:
+
+  /root/bitrix_connector/.env
+  /root/bitrix_connector/storage/connector.db
+
+Для согласованной копии SQLite:
+
+  cd /root/bitrix_connector
+  sudo docker-compose stop connector
+  sudo mkdir -p /root/backups
+  sudo cp storage/connector.db /root/backups/connector-$(date +%F).db
+  sudo docker-compose start connector
