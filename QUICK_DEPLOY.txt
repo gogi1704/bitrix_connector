@@ -69,8 +69,9 @@ CLIENT_SECRET=xxxxxxxxx
 BITRIX_DOMAIN=
 BITRIX_ACCESS_TOKEN=
 BITRIX_OPENLINE_ID=17
-BITRIX_APPLICATION_TOKEN=xxxxxxxxx
+BITRIX_INSTALL_TOKEN=xxxxxxxxx
 CONNECTOR_ADMIN_TOKEN=xxxxxxxxx
+BITRIX_APPLICATION_TOKEN=
 
 MAX_API_URL=https://platform-api2.max.ru
 MAX_BOT_TOKEN=xxxxxxxxx
@@ -88,6 +89,9 @@ JOB_POLL_SECONDS=0.5
 Сгенерировать отдельные секреты:
 
 openssl rand -hex 32
+
+Выполнить команду три раза и использовать разные значения для:
+BITRIX_INSTALL_TOKEN, CONNECTOR_ADMIN_TOKEN и MAX_WEBHOOK_SECRET.
 
 chmod 600 /root/bitrix_connector/.env
 
@@ -188,13 +192,28 @@ imopenlines, imconnector, im, disk.
 
 В настройках приложения указать обработчик установки:
 
-https://chelovecbitmax.ru/bitrix/install
+https://chelovecbitmax.ru/bitrix/install?install_token=ВАШ_BITRIX_INSTALL_TOKEN
+
+BITRIX_INSTALL_TOKEN — секрет, который вы сами сгенерировали и записали в .env.
+BITRIX_APPLICATION_TOKEN вручную получать и заполнять не нужно: Bitrix24 пришлёт
+его вместе с access_token и refresh_token, а коннектор сохранит всё в
+/root/bitrix_connector/storage/oauth.json.
 
 После этого переустановить приложение в Bitrix24.
 
+Проверить, что Bitrix24 прислал токены, не выводя их значения:
+
+docker exec bitrix_connector python -c "import json; d=json.load(open('/app/storage/oauth.json')); print({k: bool(d.get(k)) for k in ('access_token','refresh_token','application_token')})"
+
+Ожидается:
+{'access_token': True, 'refresh_token': True, 'application_token': True}
+
 В терминале сервера указать тот же CONNECTOR_ADMIN_TOKEN, который записан в .env:
 
-export ADMIN_TOKEN='xxxxxxxxx'
+export ADMIN_TOKEN='ВАШ_CONNECTOR_ADMIN_TOKEN'
+
+Важно: для curl используется переменная ADMIN_TOKEN. Простая команда
+CONNECTOR_ADMIN_TOKEN=... не изменяет переменные уже запущенного контейнера.
 
 Подключить событие сообщений операторов:
 

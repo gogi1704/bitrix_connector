@@ -76,7 +76,8 @@ BITRIX CONNECTOR — ИНСТРУКЦИЯ ПО РАЗВЁРТЫВАНИЮ НА �
   CLIENT_ID=local.xxxxxxxxx
   CLIENT_SECRET=xxxxxxxxx
   BITRIX_OPENLINE_ID=17
-  BITRIX_APPLICATION_TOKEN=xxxxxxxxx
+  BITRIX_INSTALL_TOKEN=отдельный_длинный_случайный_секрет
+  BITRIX_APPLICATION_TOKEN=
   CONNECTOR_ADMIN_TOKEN=отдельный_длинный_случайный_секрет
 
   MAX_BOT_TOKEN=xxxxxxxxx
@@ -92,6 +93,9 @@ BITRIX CONNECTOR — ИНСТРУКЦИЯ ПО РАЗВЁРТЫВАНИЮ НА �
 Сгенерируйте отдельные секреты для MAX и административных маршрутов:
 
   openssl rand -hex 32
+
+Выполните команду три раза. Значения BITRIX_INSTALL_TOKEN,
+CONNECTOR_ADMIN_TOKEN и MAX_WEBHOOK_SECRET должны быть разными.
 
 Ограничьте доступ к файлу:
 
@@ -201,28 +205,44 @@ CONNECTOR_HOST_PORT в .env и замените 8001 на 8011 в строке p
 
 1) В настройках локального приложения Bitrix24 укажите адрес установки:
 
-  https://chelovecbitmax.ru/bitrix/install
+  https://chelovecbitmax.ru/bitrix/install?install_token=ВАШ_BITRIX_INSTALL_TOKEN
+
+BITRIX_INSTALL_TOKEN генерируется вами и хранится в .env. Поле
+BITRIX_APPLICATION_TOKEN оставьте пустым: во время установки Bitrix24 сам
+передаст application_token, access_token и refresh_token. Коннектор сохранит
+их в storage/oauth.json. CLIENT_SECRET нельзя использовать вместо
+BITRIX_APPLICATION_TOKEN.
 
 Если изменялись права приложения или адрес установки — переустановите
 локальное приложение. У приложения должны быть права Открытых линий:
 imopenlines, imconnector, im и disk.
 
+После переустановки проверьте сохранение токенов без вывода секретов:
+
+  sudo docker compose exec connector python -c "import json; d=json.load(open('/app/storage/oauth.json')); print({k: bool(d.get(k)) for k in ('access_token','refresh_token','application_token')})"
+
+Все три значения должны быть True.
+
+В терминале сервера задайте удобную переменную для административных команд:
+
+  export ADMIN_TOKEN='ВАШ_CONNECTOR_ADMIN_TOKEN'
+
 2) Зарегистрируйте обработчик событий Bitrix24. Команда также удалит старые
 адреса ngrok для ответов операторов:
 
   curl -X POST \
-    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
     https://chelovecbitmax.ru/bitrix/openlines/test/bind
 
 3) Подключите MAX-бота и его webhook к новому адресу:
 
   curl -X POST \
-    -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+    -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
     https://chelovecbitmax.ru/bitrix/max/setup
 
 4) Убедитесь, что в списке обработчиков присутствует только актуальный домен:
 
-  curl -H "X-Connector-Admin-Token: ВАШ_CONNECTOR_ADMIN_TOKEN" \
+  curl -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
     https://chelovecbitmax.ru/bitrix/openlines/test/handlers
 
 8. ПОВСЕДНЕВНЫЕ КОМАНДЫ

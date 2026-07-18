@@ -20,16 +20,22 @@ TEST_CONNECTOR_ID = "bitrix_connector_test"
 TEST_CONNECTOR_ICON = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%2F%3E"
 
 
+def tokens_equal(expected: str | None, received: str | None) -> bool:
+    """Compare arbitrary token strings without compare_digest ASCII errors."""
+    return secrets.compare_digest(
+        str(expected or "").encode("utf-8"),
+        str(received or "").encode("utf-8"),
+    )
+
+
 def require_admin_token(request: Request) -> None:
     """Protect endpoints that mutate or expose connector configuration."""
-    expected_token = Config.CONNECTOR_ADMIN_TOKEN or OAuthService().load().get(
-        "application_token"
-    )
+    expected_token = Config.CONNECTOR_ADMIN_TOKEN
     if not expected_token:
         raise HTTPException(status_code=503, detail="Connector admin token is not configured")
 
     received_token = request.headers.get("X-Connector-Admin-Token", "")
-    if not secrets.compare_digest(expected_token, received_token):
+    if not tokens_equal(expected_token, received_token):
         raise HTTPException(status_code=403, detail="Invalid connector admin token")
 
 
@@ -49,24 +55,33 @@ def get_auth_data(form: dict) -> dict:
 @router.post("/install")
 async def install(request: Request):
 
+    if not Config.BITRIX_INSTALL_TOKEN:
+        raise HTTPException(status_code=503, detail="Bitrix install token is not configured")
+    received_install_token = request.query_params.get("install_token", "")
+    if not tokens_equal(Config.BITRIX_INSTALL_TOKEN, received_install_token):
+        raise HTTPException(status_code=403, detail="Invalid Bitrix install token")
+
     form = dict(await request.form())
     auth = get_auth_data(form)
 
-    if not auth.get("access_token") or not auth.get("refresh_token"):
+    if not all(
+        auth.get(field)
+        for field in ("access_token", "refresh_token", "application_token")
+    ):
         raise HTTPException(status_code=400, detail="Bitrix OAuth auth data is required")
 
-    expected_token = Config.BITRIX_APPLICATION_TOKEN or OAuthService().load().get(
-        "application_token"
-    )
-    received_token = str(auth.get("application_token", ""))
-    if not expected_token:
-        raise HTTPException(status_code=503, detail="Bitrix application token is not configured")
-    if not secrets.compare_digest(expected_token, received_token):
-        raise HTTPException(status_code=403, detail="Invalid Bitrix application token")
+    oauth = OAuthService()
+    existing_auth = oauth.load()
+    existing_member_id = existing_auth.get("member_id")
+    received_member_id = auth.get("member_id")
+    if existing_member_id and received_member_id and not tokens_equal(
+        existing_member_id, received_member_id
+    ):
+        raise HTTPException(status_code=409, detail="Another Bitrix portal is already installed")
 
     # Bitrix sends OAuth credentials in the installation form. Store them in
     # the same place used by BitrixClient so calls work immediately after install.
-    OAuthService().save(auth)
+    oauth.save({**existing_auth, **auth})
 
     return {"result": "ok"}
 
@@ -102,14 +117,14 @@ async def receive_event(request: Request):
     """Receive and record a Bitrix24 event without retaining OAuth secrets."""
     form = dict(await request.form())
     auth = get_auth_data(form)
-    expected_token = Config.BITRIX_APPLICATION_TOKEN or OAuthService().load().get(
+    expected_token = OAuthService().load().get(
         "application_token"
-    )
+    ) or Config.BITRIX_APPLICATION_TOKEN
     received_token = auth.get("application_token")
 
     if not expected_token:
         raise HTTPException(status_code=503, detail="Bitrix application token is not configured")
-    if not secrets.compare_digest(str(expected_token), str(received_token or "")):
+    if not tokens_equal(expected_token, received_token):
         raise HTTPException(status_code=403, detail="Invalid Bitrix application token")
 
     media_fields = attachment_field_names(form)

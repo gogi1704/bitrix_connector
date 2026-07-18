@@ -39,10 +39,12 @@ class FakeRequest:
         self,
         *,
         headers: dict | None = None,
+        query_params: dict | None = None,
         form: dict | None = None,
         json=None,
     ):
         self.headers = headers or {}
+        self.query_params = query_params or {}
         self._form = form or {}
         self._json = json
 
@@ -64,16 +66,25 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                 FakeRequest(headers={"X-Connector-Admin-Token": "expected"})
             )
 
-    async def test_install_rejects_untrusted_application_token(self):
+    def test_admin_endpoint_rejects_non_ascii_token_without_server_error(self):
+        with patch.object(Config, "CONNECTOR_ADMIN_TOKEN", "expected"):
+            with self.assertRaises(HTTPException) as raised:
+                require_admin_token(
+                    FakeRequest(headers={"X-Connector-Admin-Token": "неверный"})
+                )
+        self.assertEqual(raised.exception.status_code, 403)
+
+    async def test_install_rejects_untrusted_install_token(self):
         request = FakeRequest(
+            query_params={"install_token": "wrong"},
             form={
                 "auth[access_token]": "access",
                 "auth[refresh_token]": "refresh",
-                "auth[application_token]": "untrusted",
+                "auth[application_token]": "bitrix-generated",
             }
         )
         with (
-            patch.object(Config, "BITRIX_APPLICATION_TOKEN", "expected"),
+            patch.object(Config, "BITRIX_INSTALL_TOKEN", "expected"),
             patch("app.routes.bitrix.OAuthService.save") as save,
         ):
             with self.assertRaises(HTTPException) as raised:
@@ -81,6 +92,26 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 403)
         save.assert_not_called()
+
+    async def test_install_saves_application_token_received_from_bitrix(self):
+        request = FakeRequest(
+            query_params={"install_token": "setup-secret"},
+            form={
+                "auth[access_token]": "access",
+                "auth[refresh_token]": "refresh",
+                "auth[application_token]": "bitrix-generated",
+                "auth[member_id]": "portal-1",
+            },
+        )
+        with (
+            patch.object(Config, "BITRIX_INSTALL_TOKEN", "setup-secret"),
+            patch("app.routes.bitrix.OAuthService.load", return_value={}),
+            patch("app.routes.bitrix.OAuthService.save") as save,
+        ):
+            result = await install(request)
+
+        self.assertEqual(result, {"result": "ok"})
+        self.assertEqual(save.call_args.args[0]["application_token"], "bitrix-generated")
 
     async def test_max_webhook_fails_closed_without_secret(self):
         with patch.object(Config, "MAX_WEBHOOK_SECRET", ""):
