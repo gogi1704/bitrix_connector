@@ -242,6 +242,82 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(row["payload_json"], "{}")
 
 
+    def test_old_profile_table_is_extended_without_losing_cached_data(self):
+        database_path = MessageDatabase.PATH
+        database_path.unlink()
+        connection = sqlite3.connect(database_path)
+        try:
+            with connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE user_profiles (
+                        external_user_id TEXT PRIMARY KEY,
+                        age INTEGER,
+                        weight TEXT,
+                        height TEXT,
+                        sex TEXT,
+                        source_synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO user_profiles (
+                        external_user_id, age, weight, height, sex
+                    ) VALUES ('7', 35, '72', '180', 'Мужчина');
+                    """
+                )
+        finally:
+            connection.close()
+
+        migrated = MessageDatabase()
+        profile = migrated.get_user_profile("7")
+        self.assertEqual(profile["age"], 35)
+        self.assertEqual(profile["sex"], "Мужчина")
+        self.assertIn("phone", profile)
+        self.assertIsNone(profile["client_synced_at"])
+
+    def test_chat_is_archived_as_one_block_and_working_messages_are_deleted(self):
+        dialog_id = self.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            external_user_name="Test User",
+            line_id=17,
+        )
+        self.database.save_message(
+            dialog_id=dialog_id,
+            direction="max_to_bitrix",
+            text="Здравствуйте",
+            external_message_id="m1",
+        )
+        self.database.save_message(
+            dialog_id=dialog_id,
+            direction="bitrix_to_max",
+            text="Добрый день",
+            bitrix_message_id="b1",
+        )
+
+        archive = self.database.archive_dialog_messages(
+            dialog_id=dialog_id,
+            completed_by="99",
+            source_message_id="42:complete-1",
+        )
+        repeated = self.database.archive_dialog_messages(
+            dialog_id=dialog_id,
+            completed_by="99",
+            source_message_id="42:complete-1",
+        )
+
+        self.assertEqual(archive["id"], repeated["id"])
+        self.assertEqual(archive["message_count"], 2)
+        self.assertIn("Клиент: Здравствуйте", archive["transcript_text"])
+        self.assertIn("Менеджер: Добрый день", archive["transcript_text"])
+        stored = self.database.get_chat_archive(archive["id"])
+        self.assertEqual(stored["completed_by"], "99")
+        with self.database._connect() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+
+
 class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -429,6 +505,105 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
         )
         max_client.return_value.send_message.assert_not_called()
 
+    async def test_help_command_is_shown_only_in_bitrix(self):
+        router = MessageRouter()
+        router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            line_id=17,
+        )
+        with (
+            patch("app.services.message_router.MaxClient") as max_client,
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+        ):
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/help", chat_id="42", source_message_id="help-1"
+            )
+        max_client.return_value.send_message.assert_not_called()
+        response = bitrix_client.return_value.call.await_args.args[1]
+        self.assertIn("/chat_complete", response["MESSAGES"][0]["message"]["text"])
+
+    async def test_client_command_uses_cached_profile_service(self):
+        router = MessageRouter()
+        router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            external_user_name="Test User",
+            line_id=17,
+        )
+        with (
+            patch("app.services.message_router.UserProfileService") as service,
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+        ):
+            service.return_value.get_client_profile = AsyncMock(
+                return_value={"external_user_id": "7", "phone": "+70000000000"}
+            )
+            service.return_value.format_client.return_value = "Карточка клиента"
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/client", chat_id="42", source_message_id="client-1"
+            )
+        service.return_value.get_client_profile.assert_awaited_once_with("7")
+        response = bitrix_client.return_value.call.await_args.args[1]
+        self.assertEqual(response["MESSAGES"][0]["message"]["text"], "Карточка клиента")
+
+    async def test_results_command_reports_ready_results(self):
+        router = MessageRouter()
+        router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            line_id=17,
+        )
+        with (
+            patch("app.services.message_router.UserProfileService") as service,
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+        ):
+            service.return_value.get_results = AsyncMock(
+                return_value={"med_id": "55", "results": "Готово"}
+            )
+            service.return_value.format_results.return_value = "Результаты: Готово"
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/results", chat_id="42", source_message_id="results-1"
+            )
+        service.return_value.get_results.assert_awaited_once_with("7")
+        response = bitrix_client.return_value.call.await_args.args[1]
+        self.assertEqual(response["MESSAGES"][0]["message"]["text"], "Результаты: Готово")
+
+    async def test_chat_complete_archives_messages_without_saving_confirmation(self):
+        router = MessageRouter()
+        dialog_id = router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            line_id=17,
+        )
+        router.database.save_message(
+            dialog_id=dialog_id,
+            direction="max_to_bitrix",
+            text="Вопрос",
+        )
+        with patch("app.services.message_router.BitrixClient") as bitrix_client:
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/chat_complete",
+                chat_id="42",
+                source_message_id="complete-1",
+                completed_by="99",
+            )
+        with router.database._connect() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone()[0]
+            archive = connection.execute("SELECT * FROM chat_archives").fetchone()
+        self.assertEqual(remaining, 0)
+        self.assertEqual(archive["message_count"], 1)
+        self.assertEqual(archive["completed_by"], "99")
+
     async def test_anketa_reports_profile_not_found(self):
         router = MessageRouter()
         router.database.upsert_dialog(
@@ -537,6 +712,33 @@ class UserProfileServiceTests(unittest.IsolatedAsyncioTestCase):
         formatted = service.format_profile(profile)
         self.assertIn("Пол: Мужчина", formatted)
         self.assertIn("Возраст: 35", formatted)
+
+
+    async def test_results_are_loaded_once_and_cached(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(
+                MessageDatabase,
+                "PATH",
+                Path(directory) / "connector.db",
+            ):
+                database = MessageDatabase()
+                service = UserProfileService(database)
+                loaded = {
+                    "external_user_id": "7",
+                    "med_id": "55",
+                    "results": "Общий анализ готов",
+                }
+                with patch.object(
+                    service,
+                    "_load_results",
+                    return_value=loaded,
+                ) as google_loader:
+                    first = await service.get_results("7")
+                    second = await service.get_results("7")
+
+        self.assertEqual(first["results"], "Общий анализ готов")
+        self.assertEqual(second["med_id"], "55")
+        google_loader.assert_called_once_with("7")
 
 
 class MediaParsingTests(unittest.TestCase):

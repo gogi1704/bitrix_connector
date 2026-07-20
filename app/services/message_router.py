@@ -219,6 +219,7 @@ class MessageRouter:
                 command=command,
                 chat_id=str(chat_id),
                 source_message_id=str(bitrix_message_id or raw_text),
+                completed_by=form.get("data[MESSAGES][0][message][user_id]"),
             )
             return
 
@@ -260,6 +261,7 @@ class MessageRouter:
         command: str,
         chat_id: str,
         source_message_id: str,
+        completed_by: str | None = None,
     ) -> None:
         response_message_id = "internal-command-" + hashlib.sha256(
             f"{chat_id}:{source_message_id}".encode("utf-8")
@@ -275,7 +277,14 @@ class MessageRouter:
             )
             return
 
-        if command not in {"/anketa", "/anketa_refresh"}:
+        if command not in {
+            "/help",
+            "/client",
+            "/anketa",
+            "/anketa_refresh",
+            "/results",
+            "/chat_complete",
+        }:
             await self._send_internal_message(
                 chat_id=chat_id,
                 user_id=dialog.get("external_user_id") or chat_id,
@@ -288,6 +297,96 @@ class MessageRouter:
 
         profile_service = UserProfileService(self.database)
         user_id = dialog.get("external_user_id") or chat_id
+
+        if command == "/help":
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=(
+                    "🛠 Команды менеджера\n\n"
+                    "/client — карточка клиента\n"
+                    "/anketa — рост, вес, возраст и пол\n"
+                    "/anketa_refresh — обновить анкету из Google\n"
+                    "/results — результаты анализов\n"
+                    "/chat_complete — архивировать завершённый диалог"
+                ),
+                dialog_id=int(dialog["id"]),
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/chat_complete":
+            archive = self.database.archive_dialog_messages(
+                dialog_id=int(dialog["id"]),
+                completed_by=str(completed_by) if completed_by else None,
+                source_message_id=f"{chat_id}:{source_message_id}",
+            )
+            response_text = (
+                f"✅ Диалог сохранён в архиве №{archive['id']}. "
+                f"Сообщений: {archive['message_count']}. Рабочая история очищена."
+                if archive
+                else "ℹ️ В рабочей истории нет сообщений для архивирования."
+            )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/client":
+            try:
+                profile = await profile_service.get_client_profile(user_id)
+            except UserProfileError:
+                logger.exception("Could not load client card for MAX user %s", user_id)
+                response_text = "⚠️ Не удалось получить карточку. Повторите команду позже."
+            else:
+                response_text = (
+                    profile_service.format_client(
+                        profile,
+                        fallback_name=dialog.get("external_user_name"),
+                    )
+                    if profile
+                    else f"🔍 Карточка пользователя с ID {user_id} не найдена."
+                )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                dialog_id=int(dialog["id"]),
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/results":
+            try:
+                result = await profile_service.get_results(user_id)
+            except UserProfileError:
+                logger.exception("Could not load results for MAX user %s", user_id)
+                response_text = "⚠️ Не удалось получить результаты. Повторите команду позже."
+            else:
+                if not result:
+                    response_text = f"🔍 Пользователь с ID {user_id} не найден."
+                elif not result.get("med_id"):
+                    response_text = "ℹ️ Медицинский ID пользователя пока не назначен."
+                elif not result.get("results"):
+                    response_text = "ℹ️ Результаты анализов пока не готовы."
+                else:
+                    response_text = profile_service.format_results(result)
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                dialog_id=int(dialog["id"]),
+                message_id=response_message_id,
+            )
+            return
+
         try:
             profile = await profile_service.get_profile(
                 user_id,
