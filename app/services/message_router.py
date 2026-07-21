@@ -2,11 +2,15 @@ import hashlib
 import logging
 import re
 import time
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.config import Config
 from app.resources.messages import BITRIX_DIALOG_STARTED_TEXT, MAX_WELCOME_TEXT
 from app.services.bitrix_client import BitrixClient
+from app.services.followups import mirror_bot_message_to_bitrix
+from app.services.manager_tools import ALLOWED_TAGS, DialogSummaryService
 from app.services.max_client import MaxClient
 from app.services.media import (
     attachment_metadata,
@@ -28,6 +32,20 @@ class MessageRouter:
     def __init__(self):
         self.database = MessageDatabase()
 
+    def _schedule_followup_analysis(self, *, dialog_id: int, message_id: int) -> None:
+        if not Config.FOLLOWUP_ENABLED:
+            return
+        followup_id = self.database.create_followup_plan(
+            dialog_id=dialog_id,
+            based_on_message_id=message_id,
+        )
+        self.database.enqueue(
+            job_type="followup_plan",
+            payload={"followup_id": followup_id},
+            dedupe_key=f"followup:plan:{followup_id}",
+            available_at=time.time() + max(1, Config.FOLLOWUP_DELAY_MINUTES) * 60,
+        )
+
     @staticmethod
     def bitrix_to_max_text(text: str) -> str:
         """Turn Bitrix BBCode-style operator messages into readable MAX text."""
@@ -38,8 +56,8 @@ class MessageRouter:
         return text.strip()
 
     @staticmethod
-    def extract_operator_command(text: str) -> str | None:
-        """Extract a leading slash command from Bitrix operator BBCode."""
+    def extract_operator_request(text: str) -> tuple[str, str] | None:
+        """Extract a leading slash command and its arguments from Bitrix BBCode."""
         text = text or ""
         text = re.sub(
             r"^\s*\[b\].+?:\[/b\]\s*\[br\]\s*",
@@ -50,18 +68,26 @@ class MessageRouter:
         )
         text = re.sub(r"\[br\]", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"\[/?(?:b|i|u|s)\]", "", text, flags=re.IGNORECASE).strip()
-        if text.startswith("/"):
-            return text.split(maxsplit=1)[0].casefold()
+        candidate = text if text.startswith("/") else None
 
         # Be tolerant of other Bitrix speaker markup: a command may remain on
         # the final line after the operator name has been stripped partially.
-        text = re.sub(r"\[/?[^\]]+\]", "", text).strip()
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if lines and lines[-1].startswith("/") and (
-            len(lines) == 1 or " ".join(lines[:-1]).endswith(":")
-        ):
-            return lines[-1].split(maxsplit=1)[0].casefold()
-        return None
+        if candidate is None:
+            text = re.sub(r"\[/?[^\]]+\]", "", text).strip()
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if lines and lines[-1].startswith("/") and (
+                len(lines) == 1 or " ".join(lines[:-1]).endswith(":")
+            ):
+                candidate = lines[-1]
+        if candidate is None:
+            return None
+        parts = candidate.split(maxsplit=1)
+        return parts[0].casefold(), parts[1].strip() if len(parts) > 1 else ""
+
+    @staticmethod
+    def extract_operator_command(text: str) -> str | None:
+        request = MessageRouter.extract_operator_request(text)
+        return request[0] if request else None
 
     @staticmethod
     def _safe_name(value: str | None) -> str:
@@ -125,12 +151,18 @@ class MessageRouter:
             bitrix_session_id=session.get("ID"),
             line_id=int(Config.BITRIX_OPENLINE_ID),
         )
-        self.database.save_message(
+        message_row_id = self.database.save_message(
             dialog_id=dialog_id,
             direction="max_to_bitrix",
             text=text,
             external_message_id=max_message_id,
             media=attachment_metadata(attachments),
+        )
+        self.database.cancel_pending_followups(
+            dialog_id, reason="Клиент продолжил диалог"
+        )
+        self._schedule_followup_analysis(
+            dialog_id=dialog_id, message_id=message_row_id
         )
         return {"result": "forwarded", "bitrix": result}
 
@@ -198,6 +230,13 @@ class MessageRouter:
 
         await MaxClient().send_message(int(chat_id), MAX_WELCOME_TEXT)
         self.database.mark_welcome_sent(dialog_id)
+        dialog = self.database.get_dialog(channel="max", external_chat_id=chat_id)
+        if dialog is not None:
+            await mirror_bot_message_to_bitrix(
+                dialog,
+                text=MAX_WELCOME_TEXT,
+                message_id=f"max-welcome-mirror-{chat_id}",
+            )
         return {"result": "started", "bitrix": result}
 
     async def from_bitrix(self, form: dict) -> None:
@@ -213,10 +252,12 @@ class MessageRouter:
         if not chat_id or (not raw_text and not files and not file_ids):
             return
 
-        command = self.extract_operator_command(raw_text) if raw_text else None
-        if command:
+        command_request = self.extract_operator_request(raw_text) if raw_text else None
+        if command_request:
+            command, arguments = command_request
             await self._handle_operator_command(
                 command=command,
+                arguments=arguments,
                 chat_id=str(chat_id),
                 source_message_id=str(bitrix_message_id or raw_text),
                 completed_by=form.get("data[MESSAGES][0][message][user_id]"),
@@ -247,18 +288,23 @@ class MessageRouter:
             external_chat_id=str(chat_id),
             line_id=int(Config.BITRIX_OPENLINE_ID),
         )
-        self.database.save_message(
+        message_row_id = self.database.save_message(
             dialog_id=dialog_id,
             direction="bitrix_to_max",
             text=text,
             bitrix_message_id=str(bitrix_message_id) if bitrix_message_id else None,
             media=attachment_metadata(files),
         )
+        if text or files:
+            self._schedule_followup_analysis(
+                dialog_id=dialog_id, message_id=message_row_id
+            )
 
     async def _handle_operator_command(
         self,
         *,
         command: str,
+        arguments: str = "",
         chat_id: str,
         source_message_id: str,
         completed_by: str | None = None,
@@ -284,13 +330,17 @@ class MessageRouter:
             "/anketa_refresh",
             "/results",
             "/chat_complete",
+            "/summary",
+            "/remind",
+            "/tag",
+            "/history",
+            "/analytics",
         }:
             await self._send_internal_message(
                 chat_id=chat_id,
                 user_id=dialog.get("external_user_id") or chat_id,
                 user_name=dialog.get("external_user_name") or "Пользователь MAX",
                 text=f"⚠️ Неизвестная служебная команда: {command}",
-                dialog_id=int(dialog["id"]),
                 message_id=response_message_id,
             )
             return
@@ -309,14 +359,180 @@ class MessageRouter:
                     "/anketa — рост, вес, возраст и пол\n"
                     "/anketa_refresh — обновить анкету из Google\n"
                     "/results — результаты анализов\n"
+                    "/summary — краткое резюме текущего диалога\n"
+                    "/remind 2h текст — напомнить менеджеру\n"
+                    "/tag повторный — добавить тег клиенту\n"
+                    "/history — завершённые обращения\n"
+                    "/history 1 — открыть первый архив в списке\n"
+                    "/analytics — ссылка на защищённую панель\n"
                     "/chat_complete — архивировать завершённый диалог"
                 ),
-                dialog_id=int(dialog["id"]),
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/analytics":
+            analytics_url = (
+                f"{Config.PUBLIC_BASE_URL}/analytics/"
+                if Config.PUBLIC_BASE_URL
+                else "/analytics/"
+            )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=(
+                    "📊 Панель аналитики\n\n"
+                    f"Адрес: {analytics_url}\n"
+                    "Логин: admin\n"
+                    "Пароль: значение CONNECTOR_ADMIN_TOKEN из .env\n\n"
+                    "Сам пароль в чат не выводится."
+                ),
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/summary":
+            response_text = DialogSummaryService(self.database).build(
+                dialog_id=int(dialog["id"]), external_user_id=str(user_id)
+            )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/tag":
+            tag = arguments.casefold().strip().replace(" ", "_")
+            if not tag:
+                current = self.database.get_user_tags(str(user_id))
+                response_text = (
+                    "🏷 Теги клиента: " + ", ".join(current)
+                    if current
+                    else "🏷 У клиента пока нет тегов."
+                )
+                response_text += "\nДоступны: " + ", ".join(ALLOWED_TAGS)
+            elif tag not in ALLOWED_TAGS:
+                response_text = "⚠️ Неизвестный тег. Доступны: " + ", ".join(ALLOWED_TAGS)
+            else:
+                added = self.database.add_user_tag(
+                    external_user_id=str(user_id),
+                    tag=tag,
+                    created_by=str(completed_by) if completed_by else None,
+                )
+                response_text = (
+                    f"✅ Тег «{tag}» добавлен клиенту."
+                    if added
+                    else f"ℹ️ Тег «{tag}» уже установлен."
+                )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/remind":
+            match = re.fullmatch(r"(\d+)\s*([mhd])\s+(.+)", arguments, re.DOTALL | re.IGNORECASE)
+            if match is None:
+                response_text = "⚠️ Формат: /remind 2h текст напоминания (m — минуты, h — часы, d — дни)."
+            else:
+                amount = int(match.group(1))
+                unit = match.group(2).casefold()
+                reminder_text = re.sub(r"\s+", " ", match.group(3)).strip()
+                seconds = amount * {"m": 60, "h": 3600, "d": 86400}[unit]
+                max_seconds = max(1, Config.REMINDER_MAX_DAYS) * 86400
+                if amount < 1 or seconds > max_seconds or len(reminder_text) > 1000:
+                    response_text = (
+                        f"⚠️ Срок должен быть от 1 минуты до {Config.REMINDER_MAX_DAYS} дней, "
+                        "а текст — не длиннее 1000 символов."
+                    )
+                else:
+                    due_at = time.time() + seconds
+                    reminder = self.database.create_manager_reminder(
+                        dialog_id=int(dialog["id"]),
+                        external_user_id=str(user_id),
+                        external_chat_id=chat_id,
+                        external_user_name=dialog.get("external_user_name"),
+                        manager_id=str(completed_by) if completed_by else None,
+                        reminder_text=reminder_text,
+                        due_at=due_at,
+                        source_message_id=f"{chat_id}:{source_message_id}",
+                    )
+                    try:
+                        timezone_info = ZoneInfo(Config.FOLLOWUP_TIMEZONE)
+                    except ZoneInfoNotFoundError:
+                        timezone_info = timezone(timedelta(hours=3))
+                    due_text = datetime.fromtimestamp(due_at, timezone_info).strftime(
+                        "%d.%m.%Y %H:%M"
+                    )
+                    response_text = (
+                        f"✅ Напоминание №{reminder['id']} установлено на {due_text}.\n"
+                        f"Текст: {reminder_text}"
+                    )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/history":
+            position_text = arguments.strip()
+            if not position_text:
+                archives = self.database.list_user_chat_archives(
+                    external_user_id=dialog.get("external_user_id"),
+                    external_chat_id=chat_id,
+                    limit=10,
+                )
+                if not archives:
+                    response_text = "ℹ️ У клиента пока нет завершённых обращений."
+                else:
+                    lines = ["🗂 Завершённые обращения (сначала новые):", ""]
+                    for index, archive in enumerate(archives, start=1):
+                        completed = str(archive.get("completed_at") or "дата не указана")
+                        lines.append(
+                            f"{index}. {completed} — {archive['message_count']} сообщений "
+                            f"(архив №{archive['id']})"
+                        )
+                    lines.append("\nОткрыть: /history 1")
+                    response_text = "\n".join(lines)
+            elif not position_text.isdigit() or int(position_text) < 1:
+                response_text = "⚠️ Формат: /history или /history 1"
+            else:
+                position = int(position_text)
+                archive = self.database.get_user_chat_archive(
+                    position=position,
+                    external_user_id=dialog.get("external_user_id"),
+                    external_chat_id=chat_id,
+                )
+                if archive is None:
+                    response_text = f"🔍 Архив под номером {position} для этого клиента не найден."
+                else:
+                    transcript = str(archive["transcript_text"])
+                    if len(transcript) > 14000:
+                        transcript = transcript[:13900].rstrip() + "\n\n[Архив сокращён для показа в чате]"
+                    response_text = f"🗂 Архив №{archive['id']}\n\n{transcript}"
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=response_text,
                 message_id=response_message_id,
             )
             return
 
         if command == "/chat_complete":
+            self.database.cancel_pending_followups(
+                int(dialog["id"]), reason="Диалог завершён менеджером"
+            )
             archive = self.database.archive_dialog_messages(
                 dialog_id=int(dialog["id"]),
                 completed_by=str(completed_by) if completed_by else None,
@@ -357,7 +573,6 @@ class MessageRouter:
                 user_id=user_id,
                 user_name=dialog.get("external_user_name") or "Пользователь MAX",
                 text=response_text,
-                dialog_id=int(dialog["id"]),
                 message_id=response_message_id,
             )
             return
@@ -382,7 +597,6 @@ class MessageRouter:
                 user_id=user_id,
                 user_name=dialog.get("external_user_name") or "Пользователь MAX",
                 text=response_text,
-                dialog_id=int(dialog["id"]),
                 message_id=response_message_id,
             )
             return
@@ -409,7 +623,6 @@ class MessageRouter:
             user_id=user_id,
             user_name=dialog.get("external_user_name") or "Пользователь MAX",
             text=response_text,
-            dialog_id=int(dialog["id"]),
             message_id=response_message_id,
         )
 
@@ -420,7 +633,6 @@ class MessageRouter:
         user_id: str,
         user_name: str,
         text: str,
-        dialog_id: int | None = None,
         message_id: str | None = None,
     ) -> None:
         """Show a service response in Bitrix without sending it to MAX."""
@@ -447,10 +659,3 @@ class MessageRouter:
                 ],
             },
         )
-        if dialog_id is not None:
-            self.database.save_message(
-                dialog_id=dialog_id,
-                direction="internal_to_bitrix",
-                text=text,
-                external_message_id=message_id,
-            )

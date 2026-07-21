@@ -52,6 +52,15 @@ def get_auth_data(form: dict) -> dict:
     }
 
 
+def operator_job_payload(form: dict) -> dict:
+    """Remove callback secrets while retaining the domain needed for Disk files."""
+    return {
+        key: value
+        for key, value in form.items()
+        if not key.startswith("auth[") or key == "auth[domain]"
+    }
+
+
 @router.post("/install")
 async def install(request: Request):
 
@@ -150,9 +159,11 @@ async def receive_event(request: Request):
         if not message_id:
             canonical_data = json.dumps(event["data"], ensure_ascii=False, sort_keys=True)
             message_id = hashlib.sha256(canonical_data.encode("utf-8")).hexdigest()
+        # The worker needs the Bitrix domain for resolving Disk files, but it
+        # must never persist callback OAuth/application tokens in the retry queue.
         MessageDatabase().enqueue(
             job_type="bitrix_operator_message",
-            payload=form,
+            payload=operator_job_payload(form),
             dedupe_key=f"bitrix:max:{message_id}",
         )
 

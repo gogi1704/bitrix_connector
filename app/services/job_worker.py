@@ -3,6 +3,8 @@ import logging
 
 from app.config import Config
 from app.services.message_router import MessageRouter
+from app.services.followups import FollowupService
+from app.services.manager_tools import ReminderService
 from app.storage.database import MessageDatabase
 
 logger = logging.getLogger(__name__)
@@ -17,6 +19,7 @@ class JobWorker:
 
     async def start(self) -> None:
         self.database.recover_processing_jobs()
+        self.database.purge_old_jobs()
         self.task = asyncio.create_task(self._run(), name="webhook-job-worker")
 
     async def stop(self) -> None:
@@ -38,6 +41,20 @@ class JobWorker:
                 await self._process(job)
             except Exception as exc:
                 logger.exception("Webhook job %s failed", job["id"])
+                if (
+                    job["job_type"] == "followup_send"
+                    and job["attempts"] >= Config.JOB_MAX_ATTEMPTS
+                ):
+                    self.database.mark_followup_failed(
+                        int(job["payload"]["followup_id"]), str(exc)
+                    )
+                if (
+                    job["job_type"] == "manager_reminder"
+                    and job["attempts"] >= Config.JOB_MAX_ATTEMPTS
+                ):
+                    self.database.mark_manager_reminder_failed(
+                        int(job["payload"]["reminder_id"]), str(exc)
+                    )
                 self.database.fail_job(
                     job_id=job["id"],
                     attempts=job["attempts"],
@@ -59,6 +76,20 @@ class JobWorker:
 
         if job["job_type"] == "bitrix_operator_message":
             await router.from_bitrix(job["payload"])
+            return
+
+        if job["job_type"] == "followup_plan":
+            await FollowupService(self.database).plan(int(job["payload"]["followup_id"]))
+            return
+
+        if job["job_type"] == "followup_send":
+            await FollowupService(self.database).send(int(job["payload"]["followup_id"]))
+            return
+
+        if job["job_type"] == "manager_reminder":
+            await ReminderService(self.database).send(
+                int(job["payload"]["reminder_id"])
+            )
             return
 
         raise ValueError(f"Unsupported job type: {job['job_type']}")

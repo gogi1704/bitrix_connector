@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from app.routes.bitrix import router as bitrix_router
+from app.routes.analytics import router as analytics_router
 from app.routes.max import router as max_router
 from app.services.bitrix_client import BitrixApiError
 from app.services.job_worker import JobWorker
@@ -33,6 +34,7 @@ app = FastAPI(
 
 app.include_router(bitrix_router)
 app.include_router(max_router)
+app.include_router(analytics_router)
 
 
 @app.exception_handler(BitrixApiError)

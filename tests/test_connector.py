@@ -1,18 +1,25 @@
 import sqlite3
 import tempfile
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
+from fastapi.security import HTTPBasicCredentials
 
 from app.config import Config
-from app.routes.bitrix import install, require_admin_token
+from app.routes.analytics import analytics_dashboard, require_analytics_auth
+from app.routes.bitrix import install, operator_job_payload, require_admin_token
 from app.routes.max import receive_max_webhook
 from app.services.bitrix_client import BitrixApiError, BitrixClient
 from app.services.max_client import MaxClient
+from app.services.manager_tools import DialogSummaryService, ReminderService
 from app.services.message_router import MessageRouter
+from app.services.followups import FollowupAgent, FollowupService
 from app.services.media import (
     attachment_metadata,
     bitrix_api_file,
@@ -119,6 +126,32 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
                 await receive_max_webhook(FakeRequest(json={}))
 
         self.assertEqual(raised.exception.status_code, 503)
+
+    def test_analytics_uses_admin_token_as_basic_password(self):
+        with patch.object(Config, "CONNECTOR_ADMIN_TOKEN", "expected"):
+            require_analytics_auth(
+                HTTPBasicCredentials(username="admin", password="expected")
+            )
+            with self.assertRaises(HTTPException) as raised:
+                require_analytics_auth(
+                    HTTPBasicCredentials(username="admin", password="wrong")
+                )
+        self.assertEqual(raised.exception.status_code, 401)
+
+    def test_bitrix_retry_payload_does_not_contain_callback_tokens(self):
+        payload = operator_job_payload(
+            {
+                "data[MESSAGES][0][message][text]": "Ответ",
+                "auth[domain]": "portal.example",
+                "auth[access_token]": "access-secret",
+                "auth[refresh_token]": "refresh-secret",
+                "auth[application_token]": "application-secret",
+            }
+        )
+        self.assertEqual(payload["auth[domain]"], "portal.example")
+        self.assertNotIn("auth[access_token]", payload)
+        self.assertNotIn("auth[refresh_token]", payload)
+        self.assertNotIn("auth[application_token]", payload)
 
 
 class BitrixClientTests(unittest.IsolatedAsyncioTestCase):
@@ -317,6 +350,255 @@ class DatabaseTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(remaining, 0)
 
+    def test_tags_and_archive_history_are_scoped_to_user(self):
+        self.assertTrue(
+            self.database.add_user_tag(external_user_id="7", tag="срочный")
+        )
+        self.assertFalse(
+            self.database.add_user_tag(external_user_id="7", tag="срочный")
+        )
+        self.assertEqual(self.database.get_user_tags("7"), ["срочный"])
+
+        dialog_id = self.database.upsert_dialog(
+            channel="max", external_chat_id="42", external_user_id="7", line_id=17
+        )
+        self.database.save_message(
+            dialog_id=dialog_id, direction="max_to_bitrix", text="Первый вопрос"
+        )
+        archive = self.database.archive_dialog_messages(
+            dialog_id=dialog_id, source_message_id="complete-tags"
+        )
+        history = self.database.list_user_chat_archives(
+            external_user_id="7", external_chat_id="42"
+        )
+        self.assertEqual(history[0]["id"], archive["id"])
+        self.assertIsNone(
+            self.database.get_user_chat_archive(
+                position=1, external_user_id="another", external_chat_id="another"
+            )
+        )
+
+    def test_failed_job_can_be_requeued_while_payload_is_retained(self):
+        self.database.enqueue(
+            job_type="max_update",
+            payload={"message": {"id": "one"}},
+            dedupe_key="failed-one",
+        )
+        job = self.database.claim_job()
+        self.database.fail_job(
+            job_id=job["id"], attempts=8, error="temporary", max_attempts=8
+        )
+        with self.database._connect() as connection:
+            failed = connection.execute(
+                "SELECT state, payload_json FROM jobs WHERE id=?", (job["id"],)
+            ).fetchone()
+        self.assertEqual(failed["state"], "failed")
+        self.assertIn("message", failed["payload_json"])
+        self.assertTrue(self.database.retry_failed_job(job["id"]))
+        retried = self.database.claim_job()
+        self.assertEqual(retried["id"], job["id"])
+        self.assertEqual(retried["attempts"], 1)
+
+    def test_analytics_snapshot_contains_only_aggregates(self):
+        snapshot = self.database.analytics_snapshot()
+        self.assertIn("dialogs", snapshot)
+        self.assertIn("queue", snapshot)
+        self.assertIn("reminders", snapshot)
+        self.assertNotIn("messages_json", str(snapshot))
+        response = analytics_dashboard()
+        self.assertIn("Аналитика коннектора", response.body.decode("utf-8"))
+        self.assertEqual(response.headers["x-frame-options"], "DENY")
+
+
+class FollowupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.path_patch = patch.object(
+            MessageDatabase,
+            "PATH",
+            Path(self.temporary_directory.name) / "connector.db",
+        )
+        self.path_patch.start()
+        self.database = MessageDatabase()
+        self.dialog_id = self.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            line_id=17,
+        )
+
+    def tearDown(self):
+        self.path_patch.stop()
+        self.temporary_directory.cleanup()
+
+    def _manager_plan(self) -> tuple[int, int]:
+        message_id = self.database.save_message(
+            dialog_id=self.dialog_id,
+            direction="bitrix_to_max",
+            text="Выберите удобное время",
+        )
+        followup_id = self.database.create_followup_plan(
+            dialog_id=self.dialog_id,
+            based_on_message_id=message_id,
+        )
+        return message_id, followup_id
+
+    async def test_plan_is_scheduled_for_agent_decision(self):
+        _, followup_id = self._manager_plan()
+        service = FollowupService(self.database)
+        service.agent.decide = AsyncMock(
+            return_value={
+                "action": "send_now",
+                "message": "Удалось выбрать удобное время?",
+                "reason": "Ожидается выбор времени",
+                "confidence": 0.9,
+            }
+        )
+        with patch.object(service, "_due_at", return_value=12345.0):
+            await service.plan(followup_id)
+
+        followup = self.database.get_followup(followup_id)
+        self.assertEqual(followup["state"], "scheduled")
+        self.assertEqual(followup["due_at"], 12345.0)
+        with self.database._connect() as connection:
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE job_type='followup_send'"
+            ).fetchone()
+        self.assertEqual(job["available_at"], 12345.0)
+
+    async def test_new_client_message_prevents_scheduled_send(self):
+        _, followup_id = self._manager_plan()
+        self.database.schedule_followup(
+            followup_id=followup_id,
+            action="follow_up_30m",
+            due_at=time.time() - 1,
+            draft_text="Получилось?",
+            reason="Ожидается действие",
+            confidence=0.9,
+        )
+        self.database.save_message(
+            dialog_id=self.dialog_id,
+            direction="max_to_bitrix",
+            text="Да, всё получилось",
+        )
+        service = FollowupService(self.database)
+        with patch("app.services.followups.MaxClient") as max_client:
+            await service.send(followup_id)
+
+        max_client.return_value.send_message.assert_not_called()
+        self.assertEqual(self.database.get_followup(followup_id)["state"], "cancelled")
+
+    async def test_duplicate_client_webhook_does_not_cancel_newer_plan(self):
+        update = {
+            "update_type": "message_created",
+            "chat_id": 42,
+            "timestamp": 1_700_000_000,
+            "message": {
+                "id": "client-1",
+                "body": {"text": "Первое сообщение"},
+            },
+        }
+        request = FakeRequest(
+            headers={"X-Max-Bot-Api-Secret": "secret"}, json=update
+        )
+        with patch.object(Config, "MAX_WEBHOOK_SECRET", "secret"):
+            first = await receive_max_webhook(request)
+
+            _, followup_id = self._manager_plan()
+            self.database.schedule_followup(
+                followup_id=followup_id,
+                action="follow_up_30m",
+                due_at=time.time() + 1800,
+                draft_text="Получилось?",
+                reason="Ожидается действие",
+                confidence=0.9,
+            )
+            duplicate = await receive_max_webhook(request)
+
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(self.database.get_followup(followup_id)["state"], "scheduled")
+
+    async def test_current_followup_is_sent_once_and_saved_in_history(self):
+        _, followup_id = self._manager_plan()
+        self.database.schedule_followup(
+            followup_id=followup_id,
+            action="follow_up_30m",
+            due_at=time.time() - 1,
+            draft_text="Удалось выбрать удобное время?",
+            reason="Ожидается выбор",
+            confidence=0.9,
+        )
+        service = FollowupService(self.database)
+        with (
+            patch("app.services.followups.MaxClient") as max_client,
+            patch("app.services.followups.BitrixClient") as bitrix_client,
+        ):
+            max_client.return_value.send_message = AsyncMock(return_value={"ok": True})
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await service.send(followup_id)
+            await service.send(followup_id)
+
+        max_client.return_value.send_message.assert_awaited_once_with(
+            42, "Удалось выбрать удобное время?"
+        )
+        self.assertEqual(self.database.get_followup(followup_id)["state"], "sent")
+        messages = self.database.get_dialog_messages(self.dialog_id)
+        self.assertEqual(messages[-1]["direction"], "automated_to_max")
+        mirror = bitrix_client.return_value.call.await_args.args[1]
+        self.assertIn(
+            "Бот отправил клиенту", mirror["MESSAGES"][0]["message"]["text"]
+        )
+
+    async def test_medical_context_requires_manager_review_without_ai(self):
+        decision = FollowupAgent._fallback(
+            [
+                {
+                    "direction": "bitrix_to_max",
+                    "text": "Расшифровка результатов обследования будет позже",
+                }
+            ]
+        )
+        self.assertEqual(decision["action"], "manager_review")
+
+    async def test_manager_review_is_reported_only_to_bitrix(self):
+        _, followup_id = self._manager_plan()
+        service = FollowupService(self.database)
+        service.agent.decide = AsyncMock(
+            return_value={
+                "action": "manager_review",
+                "message": "",
+                "reason": "Медицинский вопрос",
+                "confidence": 1.0,
+            }
+        )
+        with (
+            patch("app.services.followups.BitrixClient") as bitrix_client,
+            patch("app.services.followups.MaxClient") as max_client,
+        ):
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await service.plan(followup_id)
+
+        max_client.return_value.send_message.assert_not_called()
+        bitrix_client.return_value.call.assert_awaited_once()
+        payload = bitrix_client.return_value.call.await_args.args[1]
+        self.assertIn("требуется решение менеджера", payload["MESSAGES"][0]["message"]["text"])
+        self.assertEqual(self.database.get_followup(followup_id)["state"], "manager_review")
+
+    async def test_quick_followup_is_not_scheduled_during_quiet_hours(self):
+        current = datetime(2026, 7, 20, 21, 15, tzinfo=ZoneInfo("Europe/Moscow"))
+        with (
+            patch("app.services.followups.datetime") as datetime_mock,
+            patch.object(Config, "FOLLOWUP_DELAY_MINUTES", 30),
+            patch.object(Config, "FOLLOWUP_QUIET_START_HOUR", 21),
+            patch.object(Config, "FOLLOWUP_QUIET_END_HOUR", 9),
+        ):
+            datetime_mock.now.return_value = current
+            due_at = FollowupService._due_at("send_now")
+
+        due = datetime.fromtimestamp(due_at, ZoneInfo("Europe/Moscow"))
+        self.assertEqual(due, datetime(2026, 7, 21, 9, 0, tzinfo=ZoneInfo("Europe/Moscow")))
+
 
 class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -332,6 +614,14 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
         self.path_patch.stop()
         self.temporary_directory.cleanup()
 
+    def test_operator_command_arguments_are_preserved(self):
+        self.assertEqual(
+            MessageRouter.extract_operator_request(
+                "[b]Менеджер:[/b] [br] /remind 2h Проверить результаты"
+            ),
+            ("/remind", "2h Проверить результаты"),
+        )
+
     async def test_bot_started_retries_only_missing_welcome(self):
         update = {
             "update_type": "bot_started",
@@ -345,9 +635,11 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.services.message_router.BitrixClient") as bitrix_client,
             patch("app.services.message_router.MaxClient") as max_client,
+            patch("app.services.followups.BitrixClient") as mirror_client,
         ):
             bitrix_client.return_value.call = bitrix_call
             max_client.return_value.send_message = max_send
+            mirror_client.return_value.call = AsyncMock(return_value={"result": {}})
             router = MessageRouter()
 
             with self.assertRaisesRegex(RuntimeError, "temporary failure"):
@@ -368,7 +660,7 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_anketa_command_is_answered_in_bitrix_and_not_sent_to_max(self):
         router = MessageRouter()
-        router.database.upsert_dialog(
+        dialog_id = router.database.upsert_dialog(
             channel="max",
             external_chat_id="42",
             external_user_id="7",
@@ -405,6 +697,12 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
             payload["MESSAGES"][0]["message"]["text"], "Анкета: Test User"
         )
 
+        with router.database._connect() as connection:
+            saved = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone()[0]
+        self.assertEqual(saved, 0)
+
     async def test_unknown_slash_command_is_not_sent_to_max(self):
         router = MessageRouter()
         router.database.upsert_dialog(
@@ -437,13 +735,22 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
             "data[MESSAGES][0][im][message_id]": "101",
         }
 
-        with patch("app.services.message_router.MaxClient") as max_client:
+        started_at = time.time()
+        with (
+            patch("app.services.message_router.MaxClient") as max_client,
+            patch.object(Config, "FOLLOWUP_DELAY_MINUTES", 30),
+        ):
             max_client.return_value.send_message = AsyncMock(return_value={"ok": True})
             await router.from_bitrix(form)
 
         max_client.return_value.send_message.assert_awaited_once_with(
             42, "👤 Manager\n\nHello"
         )
+        with router.database._connect() as connection:
+            analysis_job = connection.execute(
+                "SELECT * FROM jobs WHERE job_type='followup_plan'"
+            ).fetchone()
+        self.assertGreaterEqual(analysis_job["available_at"], started_at + 1799)
 
     async def test_max_image_is_forwarded_to_bitrix_as_file(self):
         router = MessageRouter()
@@ -485,6 +792,35 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("cdn.example.org", stored_media)
         self.assertNotIn("must-not-be-stored", stored_media)
 
+    async def test_client_message_queues_ai_analysis_only_after_silence(self):
+        router = MessageRouter()
+        update = {
+            "chat_id": 42,
+            "timestamp": 1_700_000_000,
+            "message": {
+                "id": "client-text-1",
+                "sender": {"user_id": 7, "name": "Test User"},
+                "body": {"text": "Подскажите по записи"},
+            },
+        }
+        started_at = time.time()
+        with (
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+            patch.object(Config, "FOLLOWUP_DELAY_MINUTES", 30),
+        ):
+            bitrix_client.return_value.call = AsyncMock(
+                return_value={"result": {"DATA": {"RESULT": [{}]}}}
+            )
+            await router.from_max(update)
+
+        with router.database._connect() as connection:
+            followup = connection.execute("SELECT * FROM followup_jobs").fetchone()
+            analysis_job = connection.execute(
+                "SELECT * FROM jobs WHERE job_type='followup_plan'"
+            ).fetchone()
+        self.assertEqual(followup["state"], "planning")
+        self.assertGreaterEqual(analysis_job["available_at"], started_at + 1799)
+
     async def test_bitrix_file_without_text_is_sent_to_max(self):
         router = MessageRouter()
         form = {
@@ -507,7 +843,7 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_help_command_is_shown_only_in_bitrix(self):
         router = MessageRouter()
-        router.database.upsert_dialog(
+        dialog_id = router.database.upsert_dialog(
             channel="max",
             external_chat_id="42",
             external_user_id="7",
@@ -524,6 +860,139 @@ class MessageRouterTests(unittest.IsolatedAsyncioTestCase):
         max_client.return_value.send_message.assert_not_called()
         response = bitrix_client.return_value.call.await_args.args[1]
         self.assertIn("/chat_complete", response["MESSAGES"][0]["message"]["text"])
+        self.assertIn("/analytics", response["MESSAGES"][0]["message"]["text"])
+        with router.database._connect() as connection:
+            saved = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE dialog_id = ?", (dialog_id,)
+            ).fetchone()[0]
+        self.assertEqual(saved, 0)
+
+    async def test_analytics_command_shows_url_without_secret(self):
+        router = MessageRouter()
+        router.database.upsert_dialog(
+            channel="max", external_chat_id="42", external_user_id="7", line_id=17
+        )
+        with (
+            patch.object(Config, "PUBLIC_BASE_URL", "https://connector.example"),
+            patch.object(Config, "CONNECTOR_ADMIN_TOKEN", "top-secret"),
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+        ):
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/analytics", chat_id="42", source_message_id="analytics-1"
+            )
+        payload = bitrix_client.return_value.call.await_args.args[1]
+        text = payload["MESSAGES"][0]["message"]["text"]
+        self.assertIn("https://connector.example/analytics/", text)
+        self.assertIn("Логин: admin", text)
+        self.assertNotIn("top-secret", text)
+
+    async def test_tag_and_summary_are_private_manager_commands(self):
+        router = MessageRouter()
+        dialog_id = router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            external_user_name="Test User",
+            line_id=17,
+        )
+        router.database.save_message(
+            dialog_id=dialog_id,
+            direction="max_to_bitrix",
+            text="Когда будут готовы результаты?",
+        )
+        router.database.save_message(
+            dialog_id=dialog_id,
+            direction="bitrix_to_max",
+            text="Проверим и сообщим.",
+        )
+        with (
+            patch("app.services.message_router.MaxClient") as max_client,
+            patch("app.services.message_router.BitrixClient") as bitrix_client,
+        ):
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/tag",
+                arguments="ожидает_результаты",
+                chat_id="42",
+                source_message_id="tag-1",
+                completed_by="99",
+            )
+            await router._handle_operator_command(
+                command="/summary", chat_id="42", source_message_id="summary-1"
+            )
+        self.assertEqual(
+            router.database.get_user_tags("7"), ["ожидает_результаты"]
+        )
+        summary_payload = bitrix_client.return_value.call.await_args.args[1]
+        summary_text = summary_payload["MESSAGES"][0]["message"]["text"]
+        self.assertIn("Когда будут готовы", summary_text)
+        self.assertIn("ожидает_результаты", summary_text)
+        max_client.return_value.send_message.assert_not_called()
+
+    async def test_reminder_is_persistent_and_sent_only_to_bitrix(self):
+        router = MessageRouter()
+        router.database.upsert_dialog(
+            channel="max",
+            external_chat_id="42",
+            external_user_id="7",
+            external_user_name="Test User",
+            line_id=17,
+        )
+        with patch("app.services.message_router.BitrixClient") as bitrix_client:
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/remind",
+                arguments="2h Проверить результаты",
+                chat_id="42",
+                source_message_id="remind-1",
+                completed_by="99",
+            )
+        with router.database._connect() as connection:
+            reminder = connection.execute(
+                "SELECT * FROM manager_reminders"
+            ).fetchone()
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE job_type='manager_reminder'"
+            ).fetchone()
+            connection.execute(
+                "UPDATE manager_reminders SET due_at=? WHERE id=?",
+                (time.time() - 1, reminder["id"]),
+            )
+        self.assertIsNotNone(job)
+        with (
+            patch("app.services.manager_tools.BitrixClient") as bitrix_client,
+            patch("app.services.manager_tools.MaxClient", create=True) as max_client,
+        ):
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await ReminderService(router.database).send(int(reminder["id"]))
+        sent = router.database.get_manager_reminder(int(reminder["id"]))
+        self.assertEqual(sent["state"], "sent")
+        payload = bitrix_client.return_value.call.await_args.args[1]
+        self.assertIn("Проверить результаты", payload["MESSAGES"][0]["message"]["text"])
+        max_client.assert_not_called()
+
+    async def test_history_opens_only_current_users_archive(self):
+        router = MessageRouter()
+        dialog_id = router.database.upsert_dialog(
+            channel="max", external_chat_id="42", external_user_id="7", line_id=17
+        )
+        router.database.save_message(
+            dialog_id=dialog_id, direction="max_to_bitrix", text="Архивный вопрос"
+        )
+        router.database.archive_dialog_messages(
+            dialog_id=dialog_id, source_message_id="complete-history"
+        )
+        with patch("app.services.message_router.BitrixClient") as bitrix_client:
+            bitrix_client.return_value.call = AsyncMock(return_value={"result": {}})
+            await router._handle_operator_command(
+                command="/history",
+                arguments="1",
+                chat_id="42",
+                source_message_id="history-1",
+            )
+        payload = bitrix_client.return_value.call.await_args.args[1]
+        self.assertIn("Архивный вопрос", payload["MESSAGES"][0]["message"]["text"])
 
     async def test_client_command_uses_cached_profile_service(self):
         router = MessageRouter()

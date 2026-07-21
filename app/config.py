@@ -44,5 +44,31 @@ class Config:
     )
     JOB_MAX_ATTEMPTS = int(os.getenv("JOB_MAX_ATTEMPTS", 8))
     JOB_POLL_SECONDS = float(os.getenv("JOB_POLL_SECONDS", 0.5))
+    JOB_FAILED_RETENTION_DAYS = int(os.getenv("JOB_FAILED_RETENTION_DAYS", 7))
+    JOB_COMPLETED_RETENTION_DAYS = int(os.getenv("JOB_COMPLETED_RETENTION_DAYS", 30))
     MEDIA_MAX_BYTES = int(os.getenv("MEDIA_MAX_BYTES", 50 * 1024 * 1024))
     MEDIA_DOWNLOAD_TIMEOUT = float(os.getenv("MEDIA_DOWNLOAD_TIMEOUT", 120))
+
+    # Analyze a dialog once after a period of silence. The feature works with
+    # conservative templates when AI is disabled or temporarily unavailable.
+    FOLLOWUP_ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {
+        "1", "true", "yes", "on"
+    }
+    FOLLOWUP_DELAY_MINUTES = int(os.getenv("FOLLOWUP_DELAY_MINUTES", 30))
+    FOLLOWUP_NEXT_DAY_HOUR = int(os.getenv("FOLLOWUP_NEXT_DAY_HOUR", 9))
+    FOLLOWUP_TIMEZONE = os.getenv("FOLLOWUP_TIMEZONE", "Europe/Moscow")
+    FOLLOWUP_QUIET_START_HOUR = int(os.getenv("FOLLOWUP_QUIET_START_HOUR", 21))
+    FOLLOWUP_QUIET_END_HOUR = int(os.getenv("FOLLOWUP_QUIET_END_HOUR", 9))
+    FOLLOWUP_MAX_CONTEXT_MESSAGES = int(os.getenv("FOLLOWUP_MAX_CONTEXT_MESSAGES", 20))
+    FOLLOWUP_AI_ENABLED = os.getenv("FOLLOWUP_AI_ENABLED", "false").lower() in {
+        "1", "true", "yes", "on"
+    }
+    FOLLOWUP_AI_API_KEY = os.getenv("FOLLOWUP_AI_API_KEY", "")
+    FOLLOWUP_AI_BASE_URL = os.getenv(
+        "FOLLOWUP_AI_BASE_URL", "https://api.openai.com/v1"
+    ).rstrip("/")
+    FOLLOWUP_AI_MODEL = os.getenv("FOLLOWUP_AI_MODEL", "gpt-5-mini")
+    FOLLOWUP_AI_TIMEOUT = float(os.getenv("FOLLOWUP_AI_TIMEOUT", 30))
+
+    REMINDER_MAX_DAYS = int(os.getenv("REMINDER_MAX_DAYS", 365))
+    ANALYTICS_REFRESH_SECONDS = int(os.getenv("ANALYTICS_REFRESH_SECONDS", 60))
