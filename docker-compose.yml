@@ -12,8 +12,14 @@ services:
       - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
     restart: unless-stopped
     networks:
-      - connector_internal
+      connector_internal:
+      consilium_internal:
+        aliases:
+          - bitrix_connector
 
 networks:
   connector_internal:
     name: bitrix-max-connector-internal
+  consilium_internal:
+    external: true
+    name: consilium-internal

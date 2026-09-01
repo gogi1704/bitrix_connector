@@ -85,7 +85,37 @@ AFTER_TESTS_GOOGLE_SPREADSHEET_NAME=after_tests_db
 
 JOB_MAX_ATTEMPTS=8
 JOB_POLL_SECONDS=0.5
+JOB_FAILED_RETENTION_DAYS=7
+JOB_COMPLETED_RETENTION_DAYS=30
+REMINDER_MAX_DAYS=365
+ANALYTICS_REFRESH_SECONDS=60
 
+# ИИ-анализ после 30 минут тишины; новое сообщение перезапускает таймер
+FOLLOWUP_ENABLED=true
+FOLLOWUP_DELAY_MINUTES=30
+FOLLOWUP_NEXT_DAY_HOUR=9
+FOLLOWUP_TIMEZONE=Europe/Moscow
+FOLLOWUP_QUIET_START_HOUR=21
+FOLLOWUP_QUIET_END_HOUR=9
+
+# Необязательно. Без ключа работают безопасные встроенные правила.
+FOLLOWUP_AI_ENABLED=false
+FOLLOWUP_AI_API_KEY=
+FOLLOWUP_AI_MODEL=gpt-5-mini
+
+# ИИ-резюме включается автоматически после добавления ключа.
+SUMMARY_AI_API_KEY=ваш_ключ
+SUMMARY_AI_BASE_URL=https://api.openai.com/v1
+SUMMARY_AI_MODEL=gpt-5-mini
+SUMMARY_AI_TIMEOUT=60
+SUMMARY_AI_MAX_INPUT_CHARS=24000
+SUMMARY_AI_MAX_OUTPUT_TOKENS=1200
+SUMMARY_AI_CONCURRENCY=2
+
+Минимальная настройка — только SUMMARY_AI_API_KEY. Если нужно временно
+отключить ИИ, добавьте SUMMARY_AI_ENABLED=false.
+
+-----------------
 Сгенерировать отдельные секреты:
 
 openssl rand -hex 32
@@ -210,13 +240,15 @@ docker exec bitrix_connector python -c "import json; d=json.load(open('/app/stor
 
 В терминале сервера указать тот же CONNECTOR_ADMIN_TOKEN, который записан в .env:
 
-export ADMIN_TOKEN='ВАШ_CONNECTOR_ADMIN_TOKEN'
+
 
 Важно: для curl используется переменная ADMIN_TOKEN. Простая команда
 CONNECTOR_ADMIN_TOKEN=... не изменяет переменные уже запущенного контейнера.
 
 Подключить событие сообщений операторов:
 
+
+export ADMIN_TOKEN='90670eed41fbd1bc1b515869a16bec3ce15a8eb36f3d0a43c610bd3cd715b448'
 curl -X POST \
   -H "X-Connector-Admin-Token: $ADMIN_TOKEN" \
   https://chelovecbitmax.ru/bitrix/openlines/test/bind
@@ -234,8 +266,8 @@ curl \
   https://chelovecbitmax.ru/bitrix/openlines/test/handlers
 
 
-11. ПРОВЕРИТЬ КОМАНДУ АНКЕТЫ
-----------------------------
+11. ПРОВЕРИТЬ КОМАНДЫ МЕНЕДЖЕРА
+-------------------------------
 
 В открытой линии Bitrix написать:
 
@@ -243,9 +275,54 @@ curl \
 
 Команда пользователю MAX не отправляется.
 
+После успешной отправки обычного сообщения в MAX коннектор отдельно подтверждает
+Битриксу статус доставки. Если Bitrix временно недоступен, повторяется только
+статус, а сообщение пользователю повторно не отправляется.
+
 Принудительно повторить поиск в Google:
 
 /anketa_refresh
+
+Доступные команды:
+
+/help
+/client
+/anketa
+/anketa_refresh
+/results
+/summary
+/summary_all
+/remind 2h Проверить результаты
+/tag повторный
+/tag ожидает_результаты
+/tag срочный
+/tag нужна_консультация
+/history
+/history 1
+/analytics
+/chat_complete
+
+/chat_complete переносит рабочие сообщения диалога в таблицу chat_archives
+в storage/connector.db и очищает таблицу messages только для этого диалога.
+История сообщений в самом Bitrix24 и MAX не удаляется.
+
+/summary использует ИИ, если настроены SUMMARY_AI_*, иначе строит локальное
+резюме. /summary_all пакетно обрабатывает текущий диалог и все архивы только
+текущего клиента. Перед отправкой в ИИ телефоны и email обезличиваются.
+/remind поддерживает m (минуты), h (часы), d (дни). Напоминание переживает
+перезапуск контейнера и появляется только в диалоге менеджера в Bitрикс.
+/history показывает архивы только текущего клиента.
+
+Панель аналитики:
+
+https://chelovecbitmax.ru/analytics/
+
+Логин: admin
+Пароль: значение CONNECTOR_ADMIN_TOKEN из .env
+
+Панель содержит только агрегаты. В ней можно повторно поставить в очередь
+задачу, которая исчерпала автоматические попытки. Payload такой задачи хранится
+до JOB_FAILED_RETENTION_DAYS дней, затем удаляется автоматически.
 
 
 12. ОБНОВЛЕНИЕ ПРОЕКТА

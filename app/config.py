@@ -28,6 +28,8 @@ class Config:
     # installation and it is persisted in storage/oauth.json.
     BITRIX_APPLICATION_TOKEN = os.getenv("BITRIX_APPLICATION_TOKEN", "")
     CONNECTOR_ADMIN_TOKEN = os.getenv("CONNECTOR_ADMIN_TOKEN", "")
+    CONSILIUM_PAYMENT_SECRET = os.getenv("CONSILIUM_PAYMENT_SECRET", "")
+    BITRIX_PAYMENT_DIALOG_ID = os.getenv("BITRIX_PAYMENT_DIALOG_ID", "").strip()
     MAX_API_URL = os.getenv("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
     MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
     MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")
@@ -69,6 +71,19 @@ class Config:
     ).rstrip("/")
     FOLLOWUP_AI_MODEL = os.getenv("FOLLOWUP_AI_MODEL", "gpt-5-mini")
     FOLLOWUP_AI_TIMEOUT = float(os.getenv("FOLLOWUP_AI_TIMEOUT", 30))
+
+    # AI summaries reuse follow-up credentials by default, but can be
+    # configured independently when a separate model or endpoint is required.
+    SUMMARY_AI_API_KEY = os.getenv("SUMMARY_AI_API_KEY") or FOLLOWUP_AI_API_KEY
+    SUMMARY_AI_ENABLED = os.getenv(
+        "SUMMARY_AI_ENABLED", "true" if SUMMARY_AI_API_KEY else "false"
+    ).lower() in {"1", "true", "yes", "on"}
+    SUMMARY_AI_BASE_URL = os.getenv("SUMMARY_AI_BASE_URL") or FOLLOWUP_AI_BASE_URL
+    SUMMARY_AI_MODEL = os.getenv("SUMMARY_AI_MODEL") or FOLLOWUP_AI_MODEL
+    SUMMARY_AI_TIMEOUT = float(os.getenv("SUMMARY_AI_TIMEOUT", 60))
+    SUMMARY_AI_MAX_INPUT_CHARS = int(os.getenv("SUMMARY_AI_MAX_INPUT_CHARS", 24000))
+    SUMMARY_AI_MAX_OUTPUT_TOKENS = int(os.getenv("SUMMARY_AI_MAX_OUTPUT_TOKENS", 1200))
+    SUMMARY_AI_CONCURRENCY = int(os.getenv("SUMMARY_AI_CONCURRENCY", 2))
 
     REMINDER_MAX_DAYS = int(os.getenv("REMINDER_MAX_DAYS", 365))
     ANALYTICS_REFRESH_SECONDS = int(os.getenv("ANALYTICS_REFRESH_SECONDS", 60))

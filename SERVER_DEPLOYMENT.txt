@@ -90,6 +90,46 @@ BITRIX CONNECTOR — ИНСТРУКЦИЯ ПО РАЗВЁРТЫВАНИЮ НА �
   ANKETA_GOOGLE_SPREADSHEET_NAME=anamnez_db_max
   AFTER_TESTS_GOOGLE_SPREADSHEET_NAME=after_tests_db
 
+  FOLLOWUP_ENABLED=true
+  FOLLOWUP_DELAY_MINUTES=30
+  FOLLOWUP_NEXT_DAY_HOUR=9
+  FOLLOWUP_TIMEZONE=Europe/Moscow
+  FOLLOWUP_QUIET_START_HOUR=21
+  FOLLOWUP_QUIET_END_HOUR=9
+
+  JOB_MAX_ATTEMPTS=8
+  JOB_FAILED_RETENTION_DAYS=7
+  JOB_COMPLETED_RETENTION_DAYS=30
+  REMINDER_MAX_DAYS=365
+  ANALYTICS_REFRESH_SECONDS=60
+
+ИИ вызывается только после FOLLOWUP_DELAY_MINUTES минут без новых сообщений.
+Любое новое сообщение клиента или менеджера отменяет предыдущий анализ и
+запускает таймер заново. Сообщения, автоматически отправленные клиенту в MAX,
+дублируются в его диалог Битрикс с пометкой «Бот отправил клиенту».
+
+ИИ-анализ follow-up необязателен. Без него используются встроенные безопасные
+правила. Для включения добавьте в .env:
+
+  FOLLOWUP_AI_ENABLED=true
+  FOLLOWUP_AI_API_KEY=ваш_ключ
+  FOLLOWUP_AI_MODEL=gpt-5-mini
+
+Для ИИ-резюме текущего и всех архивных диалогов клиента добавьте:
+
+  SUMMARY_AI_API_KEY=ваш_ключ
+  SUMMARY_AI_BASE_URL=https://api.openai.com/v1
+  SUMMARY_AI_MODEL=gpt-5-mini
+  SUMMARY_AI_TIMEOUT=60
+  SUMMARY_AI_MAX_INPUT_CHARS=24000
+  SUMMARY_AI_MAX_OUTPUT_TOKENS=1200
+  SUMMARY_AI_CONCURRENCY=2
+
+Если SUMMARY_AI_API_KEY, SUMMARY_AI_BASE_URL или SUMMARY_AI_MODEL оставить
+пустыми, используются соответствующие FOLLOWUP_AI_* значения.
+Наличие ключа автоматически включает ИИ-резюме. Для явного отключения укажите
+SUMMARY_AI_ENABLED=false.
+
 Сгенерируйте отдельные секреты для MAX и административных маршрутов:
 
   openssl rand -hex 32
@@ -107,14 +147,33 @@ CONNECTOR_ADMIN_TOKEN и MAX_WEBHOOK_SECRET должны быть разными
 контейнеру только для чтения. Коннектор использует существующие service-account
 JSON и не изменяет код или базы работающего anketa_bot_max.
 
-Когда менеджер отправляет в диалоге Bitrix команду /anketa, коннектор не
-пересылает её пользователю MAX. Если профиля ещё нет в connector.db, выполняется
-разовый поиск MAX ID в листах user_anketa и users_max двух Google-таблиц.
-Найденные рост, вес, возраст и пол сохраняются локально и публикуются в открытой
-линии. Команда /anketa_refresh принудительно повторяет поиск в Google.
+Команды менеджера /help, /client, /anketa, /anketa_refresh, /results, /summary, /summary_all,
+/remind, /tag, /history, /analytics и /chat_complete не пересылаются пользователю MAX.
+Примеры: /remind 2h Проверить результаты, /tag срочный, /history 1.
+Данные клиента и результаты
+точечно запрашиваются по MAX ID из Google Sheets и кешируются в connector.db.
+Команда /chat_complete атомарно сохраняет переписку одним блоком в таблице
+chat_archives и очищает рабочую таблицу messages для этого диалога. Сообщения
+в самом Bitrix24 и MAX эта команда не удаляет.
 Остальные сообщения менеджера продолжают отправляться пользователю как обычно.
+После успешной отправки в MAX статус imconnector.send.status.delivery ставится
+в отдельную очередь повторов, поэтому мобильный Битрикс показывает доставку без
+риска повторно отправить клиенту само сообщение при временной ошибке Bitrix.
 Любое сообщение менеджера, начинающееся с символа /, считается служебной
 командой и в MAX не пересылается.
+
+/summary и /summary_all используют SUMMARY_AI_* при включении; без них доступна
+локальная выжимка. /summary_all анализирует все архивы только текущего клиента,
+пакетами, не смешивая данные разных пользователей. Телефоны и email перед
+внешним запросом обезличиваются, store=false. Напоминания
+хранятся в SQLite и переживают перезапуск контейнера. /history ограничивает
+поиск архивов текущим MAX-пользователем.
+
+Защищённая панель доступна по https://chelovecbitmax.ru/analytics/.
+Для Basic Auth используйте логин admin и CONNECTOR_ADMIN_TOKEN как пароль.
+Она показывает только агрегаты и позволяет вернуть окончательно упавшую задачу
+в очередь. Payload упавшей задачи хранится 7 дней по умолчанию; успешно
+выполненные задачи очищают payload сразу.
 
 4. NGINX И HTTPS-СЕРТИФИКАТ
 ---------------------------
@@ -467,3 +526,17 @@ ngrok URL и регистрирует актуальный.
   sudo mkdir -p /root/backups
   sudo cp storage/connector.db /root/backups/connector-$(date +%F).db
   sudo docker-compose start connector
+УВЕДОМЛЕНИЯ ОБ ОПЛАТЕ КОНСИЛИУМА
+================================
+
+Коннектор принимает подтверждённые платежи только по внутренней Docker-сети и
+ставит их в существующую постоянную очередь. Добавьте в рабочий .env:
+
+CONSILIUM_PAYMENT_SECRET=<случайная строка не короче 32 символов>
+BITRIX_PAYMENT_DIALOG_ID=chat123
+
+То же значение секрета укажите в .env Консилиума как BITRIX_PAYMENT_SECRET.
+Доступные OAuth-пользователю диалоги можно получить защищённым запросом
+GET /bitrix/payments/dialogs с заголовком X-Connector-Admin-Token.
+После изменения пересоберите оба контейнера. Пользователь OAuth-приложения
+Bitrix должен быть участником целевого чата и иметь право отправлять сообщения.

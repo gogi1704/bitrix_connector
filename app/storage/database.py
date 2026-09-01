@@ -885,6 +885,34 @@ class MessageDatabase:
                 ).fetchone()
             return dict(row) if row is not None else None
 
+    def list_user_chat_archives_full(
+        self,
+        *,
+        external_user_id: str | None,
+        external_chat_id: str,
+    ) -> list[dict]:
+        """Load every saved archive for one user for manager-requested analysis."""
+        with self._connect() as connection:
+            if external_user_id:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM chat_archives
+                    WHERE external_user_id = ?
+                    ORDER BY id
+                    """,
+                    (external_user_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM chat_archives
+                    WHERE external_chat_id = ?
+                    ORDER BY id
+                    """,
+                    (external_chat_id,),
+                ).fetchall()
+            return [dict(row) for row in rows]
+
     def enqueue(
         self,
         *,

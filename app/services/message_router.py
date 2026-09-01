@@ -10,7 +10,7 @@ from app.config import Config
 from app.resources.messages import BITRIX_DIALOG_STARTED_TEXT, MAX_WELCOME_TEXT
 from app.services.bitrix_client import BitrixClient
 from app.services.followups import mirror_bot_message_to_bitrix
-from app.services.manager_tools import ALLOWED_TAGS, DialogSummaryService
+from app.services.manager_tools import ALLOWED_TAGS
 from app.services.max_client import MaxClient
 from app.services.media import (
     attachment_metadata,
@@ -93,6 +93,50 @@ class MessageRouter:
     def _safe_name(value: str | None) -> str:
         name = re.sub(r"[^\w\s'\-]", "", value or "Пользователь MAX", flags=re.UNICODE).strip()
         return name[:25] or "Пользователь"
+
+    @staticmethod
+    def _max_message_id(response: dict | None, *, fallback: str) -> str:
+        response = response or {}
+        body = response.get("body") or {}
+        return str(
+            response.get("id")
+            or response.get("message_id")
+            or response.get("mid")
+            or body.get("mid")
+            or fallback
+        )
+
+    def _queue_delivery_status(
+        self,
+        *,
+        im_chat_id: str | None,
+        im_message_id: str | None,
+        external_chat_id: str,
+        external_message_ids: list[str],
+    ) -> None:
+        if (
+            not im_chat_id
+            or not str(im_chat_id).isdigit()
+            or not im_message_id
+            or not str(im_message_id).isdigit()
+            or not external_message_ids
+        ):
+            logger.warning(
+                "Bitrix delivery status was not queued: missing im.chat_id, "
+                "im.message_id, or external message id"
+            )
+            return
+        self.database.enqueue(
+            job_type="bitrix_delivery_status",
+            payload={
+                "im_chat_id": str(im_chat_id),
+                "im_message_id": str(im_message_id),
+                "external_chat_id": str(external_chat_id),
+                "external_message_ids": [str(item) for item in external_message_ids],
+                "delivered_at": int(time.time()),
+            },
+            dedupe_key=f"bitrix:delivery:{im_chat_id}:{im_message_id}",
+        )
 
     async def from_max(self, update: dict) -> dict:
         """Forward one MAX message_created update to Bitrix24."""
@@ -249,6 +293,7 @@ class MessageRouter:
         )
         file_ids = bitrix_file_ids_from_form(form)
         bitrix_message_id = form.get("data[MESSAGES][0][im][message_id]")
+        bitrix_chat_id = form.get("data[MESSAGES][0][im][chat_id]")
         if not chat_id or (not raw_text and not files and not file_ids):
             return
 
@@ -262,6 +307,12 @@ class MessageRouter:
                 source_message_id=str(bitrix_message_id or raw_text),
                 completed_by=form.get("data[MESSAGES][0][message][user_id]"),
             )
+            self._queue_delivery_status(
+                im_chat_id=str(bitrix_chat_id) if bitrix_chat_id else None,
+                im_message_id=str(bitrix_message_id) if bitrix_message_id else None,
+                external_chat_id=str(chat_id),
+                external_message_ids=[f"connector-command-{bitrix_message_id}"],
+            )
             return
 
         if not files:
@@ -273,16 +324,28 @@ class MessageRouter:
 
         text = self.bitrix_to_max_text(raw_text) if raw_text else ""
         max_client = MaxClient()
+        external_message_ids: list[str] = []
         if files:
             for index, file in enumerate(files):
-                await max_client.send_remote_file(
+                result = await max_client.send_remote_file(
                     int(chat_id),
                     url=str(file["url"]),
                     name=file.get("name"),
                     text=text if index == 0 and text else None,
                 )
+                external_message_ids.append(
+                    self._max_message_id(
+                        result,
+                        fallback=f"bitrix-{bitrix_message_id or 'unknown'}-{index + 1}",
+                    )
+                )
         else:
-            await max_client.send_message(int(chat_id), text)
+            result = await max_client.send_message(int(chat_id), text)
+            external_message_ids.append(
+                self._max_message_id(
+                    result, fallback=f"bitrix-{bitrix_message_id or 'unknown'}"
+                )
+            )
         dialog_id = self.database.upsert_dialog(
             channel="max",
             external_chat_id=str(chat_id),
@@ -292,6 +355,7 @@ class MessageRouter:
             dialog_id=dialog_id,
             direction="bitrix_to_max",
             text=text,
+            external_message_id=external_message_ids[0] if external_message_ids else None,
             bitrix_message_id=str(bitrix_message_id) if bitrix_message_id else None,
             media=attachment_metadata(files),
         )
@@ -299,6 +363,12 @@ class MessageRouter:
             self._schedule_followup_analysis(
                 dialog_id=dialog_id, message_id=message_row_id
             )
+        self._queue_delivery_status(
+            im_chat_id=str(bitrix_chat_id) if bitrix_chat_id else None,
+            im_message_id=str(bitrix_message_id) if bitrix_message_id else None,
+            external_chat_id=str(chat_id),
+            external_message_ids=external_message_ids,
+        )
 
     async def _handle_operator_command(
         self,
@@ -331,6 +401,7 @@ class MessageRouter:
             "/results",
             "/chat_complete",
             "/summary",
+            "/summary_all",
             "/remind",
             "/tag",
             "/history",
@@ -360,6 +431,7 @@ class MessageRouter:
                     "/anketa_refresh — обновить анкету из Google\n"
                     "/results — результаты анализов\n"
                     "/summary — краткое резюме текущего диалога\n"
+                    "/summary_all — ИИ-резюме всех обращений клиента\n"
                     "/remind 2h текст — напомнить менеджеру\n"
                     "/tag повторный — добавить тег клиенту\n"
                     "/history — завершённые обращения\n"
@@ -393,14 +465,53 @@ class MessageRouter:
             return
 
         if command == "/summary":
-            response_text = DialogSummaryService(self.database).build(
-                dialog_id=int(dialog["id"]), external_user_id=str(user_id)
+            accepted = self.database.enqueue(
+                job_type="manager_summary",
+                payload={
+                    "mode": "current",
+                    "dialog_id": int(dialog["id"]),
+                    "external_user_id": str(user_id),
+                    "external_chat_id": chat_id,
+                    "external_user_name": dialog.get("external_user_name"),
+                },
+                dedupe_key=f"manager-summary:{chat_id}:{source_message_id}",
             )
             await self._send_internal_message(
                 chat_id=chat_id,
                 user_id=user_id,
                 user_name=dialog.get("external_user_name") or "Пользователь MAX",
-                text=response_text,
+                text=(
+                    "⏳ Готовлю ИИ-резюме текущего диалога. Результат появится "
+                    "здесь отдельным сообщением."
+                    if accepted
+                    else "ℹ️ Этот запрос резюме уже принят в обработку."
+                ),
+                message_id=response_message_id,
+            )
+            return
+
+        if command == "/summary_all":
+            accepted = self.database.enqueue(
+                job_type="manager_summary",
+                payload={
+                    "mode": "all",
+                    "dialog_id": int(dialog["id"]),
+                    "external_user_id": str(user_id),
+                    "external_chat_id": chat_id,
+                    "external_user_name": dialog.get("external_user_name"),
+                },
+                dedupe_key=f"manager-summary-all:{chat_id}:{source_message_id}",
+            )
+            await self._send_internal_message(
+                chat_id=chat_id,
+                user_id=user_id,
+                user_name=dialog.get("external_user_name") or "Пользователь MAX",
+                text=(
+                    "⏳ Готовлю общее ИИ-резюме всех обращений этого клиента. "
+                    "Результат появится здесь отдельным сообщением."
+                    if accepted
+                    else "ℹ️ Этот запрос общего резюме уже принят в обработку."
+                ),
                 message_id=response_message_id,
             )
             return

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 from uuid import uuid4
@@ -37,6 +38,77 @@ def require_admin_token(request: Request) -> None:
     received_token = request.headers.get("X-Connector-Admin-Token", "")
     if not tokens_equal(expected_token, received_token):
         raise HTTPException(status_code=403, detail="Invalid connector admin token")
+
+
+def require_consilium_payment_secret(request: Request) -> None:
+    """Allow payment events only from the Consilium backend."""
+    expected_token = Config.CONSILIUM_PAYMENT_SECRET
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Consilium payment integration is not configured")
+    received_token = request.headers.get("X-Consilium-Payment-Secret", "")
+    if not tokens_equal(expected_token, received_token):
+        raise HTTPException(status_code=403, detail="Invalid Consilium payment secret")
+
+
+def validate_payment_notification(payload) -> dict:
+    """Return a bounded, queue-safe notification without accepting arbitrary data."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="JSON object is required")
+
+    def required_text(name: str, maximum: int, pattern: str | None = None) -> str:
+        value = str(payload.get(name, "")).strip()
+        if not value or len(value) > maximum or (pattern and not re.fullmatch(pattern, value)):
+            raise HTTPException(status_code=422, detail=f"Invalid {name}")
+        return value
+
+    order_id = required_text("order_id", 80, r"[A-Za-z0-9_-]+")
+    provider_payment_id = required_text("provider_payment_id", 80, r"[A-Za-z0-9-]+")
+    status = required_text("status", 30)
+    if status != "succeeded":
+        raise HTTPException(status_code=422, detail="Only succeeded payments are accepted")
+    currency = required_text("currency", 3, r"[A-Z]{3}")
+    try:
+        amount_kopecks = int(payload.get("amount_kopecks"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="Invalid amount_kopecks") from None
+    if amount_kopecks <= 0 or amount_kopecks > 100_000_000_000:
+        raise HTTPException(status_code=422, detail="Invalid amount_kopecks")
+
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 100:
+        raise HTTPException(status_code=422, detail="Invalid items")
+    items = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise HTTPException(status_code=422, detail="Invalid item")
+        name = str(raw_item.get("name", "")).strip()
+        try:
+            item_amount = int(raw_item.get("amount_kopecks"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Invalid item amount") from None
+        if not name or len(name) > 128 or item_amount <= 0:
+            raise HTTPException(status_code=422, detail="Invalid item")
+        items.append({"name": name, "amount_kopecks": item_amount})
+
+    company_inn = str(payload.get("company_inn", "")).strip()
+    if company_inn and not re.fullmatch(r"\d{10}|\d{12}", company_inn):
+        raise HTTPException(status_code=422, detail="Invalid company_inn")
+    return {
+        "order_id": order_id,
+        "provider_payment_id": provider_payment_id,
+        "status": status,
+        "amount_kopecks": amount_kopecks,
+        "currency": currency,
+        "client_name": str(payload.get("client_name", "")).strip()[:100],
+        "company_inn": company_inn,
+        "organization_name": str(payload.get("organization_name", "")).strip()[:300],
+        "paid_at": str(payload.get("paid_at", "")).strip()[:80],
+        "provider_created_at": str(payload.get("provider_created_at", "")).strip()[:80],
+        "provider_description": str(payload.get("provider_description", "")).strip()[:300],
+        "payment_method": str(payload.get("payment_method", "")).strip()[:100],
+        "test": bool(payload.get("test")),
+        "items": items,
+    }
 
 
 def get_auth_data(form: dict) -> dict:
@@ -99,6 +171,31 @@ async def install(request: Request):
 async def test_outbound():
     """Verify that this app can call Bitrix24 REST API."""
     return await BitrixClient().call("app.info")
+
+
+@router.post(
+    "/payments/consilium",
+    status_code=202,
+    dependencies=[Depends(require_consilium_payment_secret)],
+)
+async def receive_consilium_payment(request: Request):
+    """Persist a verified payment event and deliver it asynchronously to Bitrix."""
+    try:
+        payload = validate_payment_notification(await request.json())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
+    accepted = MessageDatabase().enqueue(
+        job_type="consilium_payment_notification",
+        payload=payload,
+        dedupe_key=f"consilium:payment:{payload['order_id']}",
+    )
+    return {"status": "queued" if accepted else "duplicate", "order_id": payload["order_id"]}
+
+
+@router.get("/payments/dialogs", dependencies=[Depends(require_admin_token)])
+async def list_payment_dialogs():
+    """List recent dialogs visible to the OAuth user for setup diagnostics."""
+    return await BitrixClient().call("im.recent.list", {"SKIP_OPENLINES": "Y"})
 
 
 @router.post("/test/bind", dependencies=[Depends(require_admin_token)])
