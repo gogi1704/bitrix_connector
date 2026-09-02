@@ -111,6 +111,8 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             "client_name": "Иван Иванов",
             "company_inn": "7701234567",
             "organization_name": "ООО Пример",
+            "brigade": "Бригада 7",
+            "examination_date": "2026-09-15",
             "paid_at": "2026-09-01T12:00:00Z",
             "test": False,
             "items": [{"name": "Чекап", "amount_kopecks": 1500000}],
@@ -134,6 +136,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             "status": "succeeded", "amount_kopecks": 1500000, "currency": "RUB",
             "client_name": "Иван Иванов", "company_inn": "7701234567",
             "organization_name": "ООО Пример", "paid_at": "2026-09-01T12:00:00Z",
+            "brigade": "Бригада 7", "examination_date": "2026-09-15",
             "test": False, "items": [{"name": "Чекап", "amount_kopecks": 1500000}],
         }
         with (
@@ -147,6 +150,8 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["DIALOG_ID"], "chat123")
         self.assertIn("Иван Иванов", params["MESSAGE"])
         self.assertIn("Чекап", params["MESSAGE"])
+        self.assertIn("Бригада 7", params["MESSAGE"])
+        self.assertIn("2026-09-15", params["MESSAGE"])
 
     async def test_payment_dialog_setup_uses_recent_dialogs(self):
         with patch("app.routes.bitrix.BitrixClient") as client:

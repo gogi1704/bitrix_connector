@@ -47,7 +47,11 @@ async def bitrix_api_error_handler(_: Request, exc: BitrixApiError):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "queue": MessageDatabase().queue_status()}
+    return {
+        "status": "ok",
+        "queue": MessageDatabase().queue_status(),
+        "capabilities": {"consilium_payment_schedule_fields": True},
+    }
 
 
 @app.get("/")

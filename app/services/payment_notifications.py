@@ -26,6 +26,8 @@ class PaymentNotificationService:
             f"[B]Клиент:[/B] {payload.get('client_name') or 'Не указано'}",
             f"[B]ИНН:[/B] {payload.get('company_inn') or 'Не указан'}",
             f"[B]Организация:[/B] {payload.get('organization_name') or 'Не определена'}",
+            f"[B]Бригада:[/B] {payload.get('brigade') or 'Не определена'}",
+            f"[B]Дата медосмотра:[/B] {payload.get('examination_date') or 'Не определена'}",
             "",
             f"[B]Заказ Консилиума:[/B] {payload['order_id']}",
             f"[B]Платёж ЮKassa:[/B] {payload['provider_payment_id']}",

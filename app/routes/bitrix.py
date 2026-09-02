@@ -93,6 +93,9 @@ def validate_payment_notification(payload) -> dict:
     company_inn = str(payload.get("company_inn", "")).strip()
     if company_inn and not re.fullmatch(r"\d{10}|\d{12}", company_inn):
         raise HTTPException(status_code=422, detail="Invalid company_inn")
+    examination_date = str(payload.get("examination_date", "")).strip()
+    if examination_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", examination_date):
+        raise HTTPException(status_code=422, detail="Invalid examination_date")
     return {
         "order_id": order_id,
         "provider_payment_id": provider_payment_id,
@@ -102,6 +105,8 @@ def validate_payment_notification(payload) -> dict:
         "client_name": str(payload.get("client_name", "")).strip()[:100],
         "company_inn": company_inn,
         "organization_name": str(payload.get("organization_name", "")).strip()[:300],
+        "brigade": str(payload.get("brigade", "")).strip()[:200],
+        "examination_date": examination_date,
         "paid_at": str(payload.get("paid_at", "")).strip()[:80],
         "provider_created_at": str(payload.get("provider_created_at", "")).strip()[:80],
         "provider_description": str(payload.get("provider_description", "")).strip()[:300],
