@@ -7,6 +7,7 @@ from app.services.followups import FollowupService
 from app.services.manager_tools import DialogSummaryService, ReminderService
 from app.services.delivery_status import DeliveryStatusService
 from app.services.payment_notifications import PaymentNotificationService
+from app.services.funnel_reports import FunnelReportService
 from app.storage.database import MessageDatabase
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,10 @@ class JobWorker:
 
         if job["job_type"] == "consilium_payment_notification":
             await PaymentNotificationService.send(job["payload"])
+            return
+
+        if job["job_type"] == "consilium_funnel_report":
+            await FunnelReportService.send(job["payload"])
             return
 
         if job["job_type"] == "manager_summary":

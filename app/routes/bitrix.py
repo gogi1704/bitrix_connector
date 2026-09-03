@@ -50,6 +50,75 @@ def require_consilium_payment_secret(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Invalid Consilium payment secret")
 
 
+def require_consilium_metrics_secret(request: Request) -> None:
+    expected_token = Config.CONSILIUM_METRICS_SECRET
+    if not expected_token:
+        raise HTTPException(status_code=503, detail="Consilium metrics integration is not configured")
+    received_token = request.headers.get("X-Consilium-Metrics-Secret", "")
+    if not tokens_equal(expected_token, received_token):
+        raise HTTPException(status_code=403, detail="Invalid Consilium metrics secret")
+
+
+def validate_funnel_report(payload) -> dict:
+    """Accept only a bounded aggregate report; individual user data is forbidden."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="JSON object is required")
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(encoded) > 256_000:
+        raise HTTPException(status_code=413, detail="Metrics report is too large")
+    report_id = str(payload.get("report_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", report_id):
+        raise HTTPException(status_code=422, detail="Invalid report_id")
+    if payload.get("schema_version") != 1:
+        raise HTTPException(status_code=422, detail="Unsupported schema_version")
+    dialog_id = str(payload.get("dialog_id", "")).strip()
+    if dialog_id and not re.fullmatch(r"(?:chat|sg)?\d+", dialog_id):
+        raise HTTPException(status_code=422, detail="Invalid dialog_id")
+    if not dialog_id and not Config.BITRIX_METRICS_DIALOG_ID:
+        raise HTTPException(status_code=422, detail="Metrics dialog is required")
+    for period_name in ("current_period", "comparison_period"):
+        period = payload.get(period_name)
+        if not isinstance(period, dict) or any(
+            not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(period.get(key, "")))
+            for key in ("date_from", "date_to")
+        ):
+            raise HTTPException(status_code=422, detail=f"Invalid {period_name}")
+    if not isinstance(payload.get("current"), dict) or not isinstance(payload.get("comparison"), dict):
+        raise HTTPException(status_code=422, detail="Current and comparison aggregates are required")
+    flows = payload.get("flows")
+    if not isinstance(flows, list) or len(flows) > 2:
+        raise HTTPException(status_code=422, detail="Invalid flows")
+    for flow in flows:
+        if not isinstance(flow, dict) or flow.get("id") not in {"standard", "result"}:
+            raise HTTPException(status_code=422, detail="Invalid flow")
+        if not isinstance(flow.get("screens"), list) or len(flow["screens"]) > 100:
+            raise HTTPException(status_code=422, detail="Invalid flow screens")
+        if not isinstance(flow.get("alerts"), list) or len(flow["alerts"]) > 20:
+            raise HTTPException(status_code=422, detail="Invalid flow alerts")
+    forbidden = {"chel_id", "phone", "tube_number", "messages", "answers", "recent"}
+
+    def inspect(value, depth: int = 0) -> None:
+        if depth > 8:
+            raise HTTPException(status_code=422, detail="Metrics report is too deeply nested")
+        if isinstance(value, dict):
+            if len(value) > 100 or forbidden.intersection(value):
+                raise HTTPException(status_code=422, detail="Metrics report contains forbidden fields")
+            for nested in value.values():
+                inspect(nested, depth + 1)
+        elif isinstance(value, list):
+            if len(value) > 200:
+                raise HTTPException(status_code=422, detail="Metrics report list is too large")
+            for nested in value:
+                inspect(nested, depth + 1)
+        elif isinstance(value, str) and len(value) > 2_000:
+            raise HTTPException(status_code=422, detail="Metrics report text is too long")
+        elif value is not None and not isinstance(value, (str, int, float, bool)):
+            raise HTTPException(status_code=422, detail="Metrics report contains an invalid value")
+
+    inspect(payload)
+    return payload
+
+
 def validate_payment_notification(payload) -> dict:
     """Return a bounded, queue-safe notification without accepting arbitrary data."""
     if not isinstance(payload, dict):
@@ -195,6 +264,28 @@ async def receive_consilium_payment(request: Request):
         dedupe_key=f"consilium:payment:{payload['order_id']}",
     )
     return {"status": "queued" if accepted else "duplicate", "order_id": payload["order_id"]}
+
+
+@router.post(
+    "/metrics/consilium",
+    status_code=202,
+    dependencies=[Depends(require_consilium_metrics_secret)],
+)
+async def receive_consilium_funnel_report(request: Request):
+    """Queue a privacy-safe aggregate funnel snapshot for a Bitrix project chat."""
+    try:
+        payload = validate_funnel_report(await request.json())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
+    accepted = MessageDatabase().enqueue(
+        job_type="consilium_funnel_report",
+        payload=payload,
+        dedupe_key=f"consilium:funnel:{payload['report_id']}",
+    )
+    return {
+        "status": "queued" if accepted else "duplicate",
+        "report_id": payload["report_id"],
+    }
 
 
 @router.get("/payments/dialogs", dependencies=[Depends(require_admin_token)])

@@ -30,6 +30,8 @@ class Config:
     CONNECTOR_ADMIN_TOKEN = os.getenv("CONNECTOR_ADMIN_TOKEN", "")
     CONSILIUM_PAYMENT_SECRET = os.getenv("CONSILIUM_PAYMENT_SECRET", "")
     BITRIX_PAYMENT_DIALOG_ID = os.getenv("BITRIX_PAYMENT_DIALOG_ID", "").strip()
+    CONSILIUM_METRICS_SECRET = os.getenv("CONSILIUM_METRICS_SECRET", "")
+    BITRIX_METRICS_DIALOG_ID = os.getenv("BITRIX_METRICS_DIALOG_ID", "").strip()
     MAX_API_URL = os.getenv("MAX_API_URL", "https://platform-api2.max.ru").rstrip("/")
     MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN", "")
     MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "")

@@ -50,7 +50,10 @@ def health():
     return {
         "status": "ok",
         "queue": MessageDatabase().queue_status(),
-        "capabilities": {"consilium_payment_schedule_fields": True},
+        "capabilities": {
+            "consilium_payment_schedule_fields": True,
+            "consilium_funnel_reports": True,
+        },
     }
 
 

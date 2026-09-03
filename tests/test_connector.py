@@ -18,8 +18,11 @@ from app.routes.bitrix import (
     list_payment_dialogs,
     operator_job_payload,
     receive_consilium_payment,
+    receive_consilium_funnel_report,
     require_admin_token,
     require_consilium_payment_secret,
+    require_consilium_metrics_secret,
+    validate_funnel_report,
     validate_payment_notification,
 )
 from app.routes.max import receive_max_webhook
@@ -30,6 +33,7 @@ from app.services.job_worker import JobWorker
 from app.services.manager_tools import DialogSummaryService, ReminderService, SummaryAgent
 from app.services.message_router import MessageRouter
 from app.services.payment_notifications import PaymentNotificationService
+from app.services.funnel_reports import FunnelReportService
 from app.services.followups import FollowupAgent, FollowupService
 from app.services.media import (
     attachment_metadata,
@@ -74,6 +78,20 @@ class FakeRequest:
 
 
 class SecurityTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def funnel_payload():
+        return {
+            "schema_version": 1, "report_id": "consilium-funnel-test-123",
+            "test": True, "dialog_id": "sg123", "period_days": 1,
+            "analysis": "payments", "analysis_label": "Оплаты",
+            "current_period": {"date_from": "2026-09-02", "date_to": "2026-09-02"},
+            "comparison_period": {"date_from": "2026-09-01", "date_to": "2026-09-01"},
+            "current": {"summary": {"visitors": 40, "users": 20}, "payments": {"attempts": 4, "successful_users": 2, "conversion": 50, "revenue_kopecks": 100000}},
+            "comparison": {"summary": {"visitors": 38, "users": 22}, "payments": {"attempts": 5, "successful_users": 3, "conversion": 60}},
+            "flows": [{"id": "standard", "label": "Обычный путь", "sample_sufficient": True, "summary": {"start_users": 40, "reached_completion": 12}, "alerts": [], "screens": []}],
+            "ai_instruction": "Проанализируй изменения.",
+        }
+
     def test_admin_endpoint_requires_matching_token(self):
         with patch.object(Config, "CONNECTOR_ADMIN_TOKEN", "expected"):
             with self.assertRaises(HTTPException) as missing:
@@ -100,6 +118,43 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             require_consilium_payment_secret(FakeRequest(headers={
                 "X-Consilium-Payment-Secret": "payment-secret",
             }))
+
+    def test_consilium_metrics_endpoint_requires_its_own_secret(self):
+        with patch.object(Config, "CONSILIUM_METRICS_SECRET", "metrics-secret"):
+            with self.assertRaises(HTTPException) as raised:
+                require_consilium_metrics_secret(FakeRequest(headers={}))
+            self.assertEqual(raised.exception.status_code, 403)
+            require_consilium_metrics_secret(FakeRequest(headers={
+                "X-Consilium-Metrics-Secret": "metrics-secret",
+            }))
+
+    async def test_consilium_funnel_report_is_private_and_deduplicated(self):
+        payload = self.funnel_payload()
+        with patch("app.routes.bitrix.MessageDatabase") as database:
+            database.return_value.enqueue.return_value = True
+            result = await receive_consilium_funnel_report(FakeRequest(json=payload))
+        self.assertEqual(result["status"], "queued")
+        call = database.return_value.enqueue.call_args.kwargs
+        self.assertEqual(call["job_type"], "consilium_funnel_report")
+        self.assertEqual(call["dedupe_key"], "consilium:funnel:consilium-funnel-test-123")
+        with self.assertRaises(HTTPException) as raised:
+            validate_funnel_report({**payload, "chel_id": "forbidden"})
+        self.assertEqual(raised.exception.status_code, 422)
+
+    async def test_funnel_report_uses_regular_chat_message(self):
+        payload = self.funnel_payload()
+        with (
+            patch.object(Config, "BITRIX_METRICS_DIALOG_ID", ""),
+            patch("app.services.funnel_reports.BitrixClient") as client,
+        ):
+            client.return_value.call = AsyncMock(return_value={"result": 42})
+            await FunnelReportService.send(payload)
+        method, params = client.return_value.call.await_args.args
+        self.assertEqual(method, "im.message.add")
+        self.assertEqual(params["DIALOG_ID"], "sg123")
+        self.assertIn("Задание для Bitrix AI", params["MESSAGE"])
+        self.assertIn("Вид анализа:[/B] Оплаты", params["MESSAGE"])
+        self.assertIn("обезличенные агрегаты", params["MESSAGE"])
 
     async def test_consilium_payment_is_validated_and_deduplicated(self):
         payload = {
