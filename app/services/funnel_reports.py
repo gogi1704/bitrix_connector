@@ -77,13 +77,17 @@ class FunnelReportService:
             lines.extend([
                 "",
                 "[B]Оплата[/B]",
-                f"Попытки: {int(payments.get('attempts', 0) or 0)} "
+                f"Попытки онлайн-оплаты: {int(payments.get('attempts', 0) or 0)} "
                 f"(ранее {int(old_payments.get('attempts', 0) or 0)})",
-                f"Успешные пользователи: {int(payments.get('successful_users', 0) or 0)} · "
-                f"конверсия {float(payments.get('conversion', 0) or 0):g}% "
+                f"Успешно оплатили онлайн: {int(payments.get('successful_users', 0) or 0)} · "
+                f"конверсия среди пользователей с онлайн-заказом "
+                f"{float(payments.get('conversion', 0) or 0):g}% "
                 f"(ранее {float(old_payments.get('conversion', 0) or 0):g}%)",
+                f"Целевое действие «Оплатить на медосмотре»: "
+                f"{int(payments.get('at_exam_users', 0) or 0)} пользователей "
+                f"(ранее {int(old_payments.get('at_exam_users', 0) or 0)})",
                 f"Выручка без тестовых платежей: {cls._money(payments.get('revenue_kopecks'))}",
-                f"Не завершено/ошибка: {int(payments.get('unsuccessful', 0) or 0)} · "
+                f"Онлайн-заказы не завершены/с ошибкой: {int(payments.get('unsuccessful', 0) or 0)} · "
                 f"в ожидании: {int(payments.get('pending', 0) or 0)}",
             ])
         errors = current.get("errors") or []
@@ -98,7 +102,7 @@ class FunnelReportService:
         lines.extend([
             "",
             "[B]Задание для Bitrix AI[/B]",
-            cls._safe(payload.get("ai_instruction"), 1_000),
+            cls._safe(payload.get("ai_instruction"), 2_000),
             "",
             "[I]В отчёте только обезличенные агрегаты. Причины отклонений, не подтверждённые данными, являются гипотезами.[/I]",
         ])

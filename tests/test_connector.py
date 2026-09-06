@@ -143,6 +143,9 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_funnel_report_uses_regular_chat_message(self):
         payload = self.funnel_payload()
+        payload["current"]["payments"]["at_exam_users"] = 3
+        payload["comparison"]["payments"]["at_exam_users"] = 2
+        payload["ai_instruction"] = "А" * 1500
         with (
             patch.object(Config, "BITRIX_METRICS_DIALOG_ID", ""),
             patch("app.services.funnel_reports.BitrixClient") as client,
@@ -154,6 +157,8 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["DIALOG_ID"], "sg123")
         self.assertIn("Задание для Bitrix AI", params["MESSAGE"])
         self.assertIn("Вид анализа:[/B] Оплаты", params["MESSAGE"])
+        self.assertIn("Оплатить на медосмотре»: 3 пользователей", params["MESSAGE"])
+        self.assertIn("А" * 1500, params["MESSAGE"])
         self.assertIn("обезличенные агрегаты", params["MESSAGE"])
 
     async def test_consilium_payment_is_validated_and_deduplicated(self):
