@@ -86,9 +86,9 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             "analysis": "payments", "analysis_label": "Оплаты",
             "current_period": {"date_from": "2026-09-02", "date_to": "2026-09-02"},
             "comparison_period": {"date_from": "2026-09-01", "date_to": "2026-09-01"},
-            "current": {"summary": {"visitors": 40, "users": 20}, "payments": {"attempts": 4, "successful_users": 2, "conversion": 50, "revenue_kopecks": 100000}},
-            "comparison": {"summary": {"visitors": 38, "users": 22}, "payments": {"attempts": 5, "successful_users": 3, "conversion": 60}},
-            "flows": [{"id": "standard", "label": "Обычный путь", "sample_sufficient": True, "summary": {"start_users": 40, "reached_completion": 12}, "alerts": [], "screens": []}],
+            "current": {"summary": {"visitors": 40, "users": 20}, "payments": {"attempts": 4, "successful_users": 2, "conversion": 50, "revenue_kopecks": 100000, "unsuccessful": 2, "pending": 1}, "errors": [{"label": "Ошибка API", "events": 3, "users": 2}]},
+            "comparison": {"summary": {"visitors": 38, "users": 22}, "payments": {"attempts": 5, "successful_users": 3, "conversion": 60, "revenue_kopecks": 140000, "unsuccessful": 2, "pending": 0}, "errors": [{"label": "Ошибка API", "events": 1, "users": 1}]},
+            "flows": [{"id": "standard", "label": "Обычный путь", "sample_sufficient": True, "summary": {"start_users": 40, "previous_start_users": 38, "reached_completion": 12, "previous_reached_completion": 19}, "alerts": [], "screens": [{"title": "Выбор способа входа", "users": 20, "previous_users": 30, "percent_of_parent": 50, "previous_percent_of_parent": 75, "percent_of_start": 50, "previous_percent_of_start": 78.9, "comparison_users": 40, "previous_comparison_users": 40, "stopped_users": 2, "previous_stopped_users": 4, "change_pp": -25}]}],
             "ai_instruction": "Проанализируй изменения.",
         }
 
@@ -158,6 +158,12 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Задание для Bitrix AI", params["MESSAGE"])
         self.assertIn("Вид анализа:[/B] Оплаты", params["MESSAGE"])
         self.assertIn("Оплатить на медосмотре»: 3 пользователей", params["MESSAGE"])
+        self.assertIn("Период сравнения: стартовали 38", params["MESSAGE"])
+        self.assertIn("Сравнение: 30 чел.", params["MESSAGE"])
+        self.assertIn("база 40", params["MESSAGE"])
+        self.assertIn("сравнение: 3 · 60%", params["MESSAGE"])
+        self.assertIn("сравнение: 1 400 ₽", params["MESSAGE"])
+        self.assertIn("сравнение 1 событий, 1 пользователей", params["MESSAGE"])
         self.assertIn("А" * 1500, params["MESSAGE"])
         self.assertIn("обезличенные агрегаты", params["MESSAGE"])
 

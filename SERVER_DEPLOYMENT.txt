@@ -534,8 +534,14 @@ ngrok URL и регистрирует актуальный.
 
 CONSILIUM_PAYMENT_SECRET=<случайная строка не короче 32 символов>
 BITRIX_PAYMENT_DIALOG_ID=chat123
+CONSILIUM_METRICS_SECRET=<другая случайная строка не короче 32 символов>
+BITRIX_METRICS_DIALOG_ID=chat78447
 
 То же значение секрета укажите в .env Консилиума как BITRIX_PAYMENT_SECRET.
+Секрет CONSILIUM_METRICS_SECRET укажите в .env Консилиума как
+BITRIX_METRICS_SECRET. Он должен отличаться от секрета платежей. Если
+BITRIX_METRICS_DIALOG_ID оставить пустым, используется чат, выбранный в
+админке Консилиума.
 Доступные OAuth-пользователю диалоги можно получить защищённым запросом
 GET /bitrix/payments/dialogs с заголовком X-Connector-Admin-Token.
 После изменения пересоберите оба контейнера. Пользователь OAuth-приложения

@@ -42,12 +42,23 @@ class FunnelReportService:
         for flow in payload.get("flows") or []:
             flow_summary = flow.get("summary") or {}
             start_users = int(flow_summary.get("start_users", 0) or 0)
+            previous_start_users = int(flow_summary.get("previous_start_users", 0) or 0)
             completion = int(flow_summary.get("reached_completion", 0) or 0)
+            previous_completion = int(
+                flow_summary.get("previous_reached_completion", 0) or 0
+            )
             completion_percent = round(completion / start_users * 100, 1) if start_users else 0.0
+            previous_completion_percent = (
+                round(previous_completion / previous_start_users * 100, 1)
+                if previous_start_users else 0.0
+            )
             lines.extend([
                 "",
                 f"[B]{cls._safe(flow.get('label') or flow.get('id'), 100)}[/B]",
-                f"Стартовали: {start_users} · дошли до результата: {completion} ({completion_percent}%)",
+                f"Текущий период: стартовали {start_users} · дошли до результата "
+                f"{completion} ({completion_percent}%)",
+                f"Период сравнения: стартовали {previous_start_users} · дошли до результата "
+                f"{previous_completion} ({previous_completion_percent}%)",
             ])
             if not flow.get("sample_sufficient"):
                 lines.append("⚠️ Выборка ниже установленного минимума — выводы предварительные.")
@@ -63,14 +74,38 @@ class FunnelReportService:
                     )
             lines.append("[B]Экраны:[/B]")
             for screen in (flow.get("screens") or [])[:60]:
-                quality = " · неполные связи" if screen.get("data_quality") == "incomplete" else ""
-                outcome = "финальный экран" if screen.get("terminal") else f"остановились {int(screen.get('stopped_users', 0) or 0)}"
-                lines.append(
-                    f"• {cls._safe(screen.get('title'))}: {int(screen.get('users', 0) or 0)} чел. · "
-                    f"{float(screen.get('percent_of_parent', 0) or 0):g}% от предыдущего · "
-                    f"Δ {float(screen.get('change_pp', 0) or 0):+g} п.п. · "
-                    f"{outcome}{quality}"
+                current_quality = (
+                    " · неполные связи" if screen.get("data_quality") == "incomplete" else ""
                 )
+                previous_quality = (
+                    " · неполные связи"
+                    if screen.get("previous_data_quality") == "incomplete" else ""
+                )
+                if screen.get("terminal"):
+                    current_outcome = previous_outcome = "финальный экран"
+                else:
+                    current_outcome = (
+                        f"остановились {int(screen.get('stopped_users', 0) or 0)}"
+                    )
+                    previous_outcome = (
+                        "остановились "
+                        f"{int(screen.get('previous_stopped_users', 0) or 0)}"
+                    )
+                lines.extend([
+                    f"• [B]{cls._safe(screen.get('title'))}[/B]",
+                    f"  Сейчас: {int(screen.get('users', 0) or 0)} чел. · "
+                    f"{float(screen.get('percent_of_parent', 0) or 0):g}% от предыдущего экрана · "
+                    f"{float(screen.get('percent_of_start', 0) or 0):g}% от старта · "
+                    f"база {int(screen.get('comparison_users', 0) or 0)} · "
+                    f"{current_outcome}{current_quality}",
+                    f"  Сравнение: {int(screen.get('previous_users', 0) or 0)} чел. · "
+                    f"{float(screen.get('previous_percent_of_parent', 0) or 0):g}% от предыдущего экрана · "
+                    f"{float(screen.get('previous_percent_of_start', 0) or 0):g}% от старта · "
+                    f"база {int(screen.get('previous_comparison_users', 0) or 0)} · "
+                    f"{previous_outcome}{previous_quality}",
+                    f"  Изменение конверсии: "
+                    f"{float(screen.get('change_pp', 0) or 0):+g} п.п.",
+                ])
         payments = current.get("payments")
         if isinstance(payments, dict):
             old_payments = previous.get("payments") or {}
@@ -82,22 +117,37 @@ class FunnelReportService:
                 f"Успешно оплатили онлайн: {int(payments.get('successful_users', 0) or 0)} · "
                 f"конверсия среди пользователей с онлайн-заказом "
                 f"{float(payments.get('conversion', 0) or 0):g}% "
-                f"(ранее {float(old_payments.get('conversion', 0) or 0):g}%)",
+                f"(сравнение: {int(old_payments.get('successful_users', 0) or 0)} · "
+                f"{float(old_payments.get('conversion', 0) or 0):g}%)",
                 f"Целевое действие «Оплатить на медосмотре»: "
                 f"{int(payments.get('at_exam_users', 0) or 0)} пользователей "
                 f"(ранее {int(old_payments.get('at_exam_users', 0) or 0)})",
-                f"Выручка без тестовых платежей: {cls._money(payments.get('revenue_kopecks'))}",
+                f"Выручка без тестовых платежей: {cls._money(payments.get('revenue_kopecks'))} "
+                f"(сравнение: {cls._money(old_payments.get('revenue_kopecks'))})",
                 f"Онлайн-заказы не завершены/с ошибкой: {int(payments.get('unsuccessful', 0) or 0)} · "
-                f"в ожидании: {int(payments.get('pending', 0) or 0)}",
+                f"в ожидании: {int(payments.get('pending', 0) or 0)} "
+                f"(сравнение: {int(old_payments.get('unsuccessful', 0) or 0)} · "
+                f"в ожидании {int(old_payments.get('pending', 0) or 0)})",
             ])
         errors = current.get("errors") or []
-        if errors:
+        previous_errors = previous.get("errors") or []
+        if errors or previous_errors:
             lines.extend(["", "[B]Технические ошибки[/B]"])
-            for item in errors[:10]:
+            current_by_label = {str(item.get("label", "")): item for item in errors}
+            previous_by_label = {
+                str(item.get("label", "")): item for item in previous_errors
+            }
+            labels = list(current_by_label)
+            labels.extend(label for label in previous_by_label if label not in current_by_label)
+            for label in labels[:10]:
+                item = current_by_label.get(label, {})
+                old_item = previous_by_label.get(label, {})
                 lines.append(
-                    f"• {cls._safe(item.get('label'), 100)}: "
+                    f"• {cls._safe(label, 100)}: сейчас "
                     f"{int(item.get('events', 0) or 0)} событий, "
-                    f"{int(item.get('users', 0) or 0)} пользователей"
+                    f"{int(item.get('users', 0) or 0)} пользователей; сравнение "
+                    f"{int(old_item.get('events', 0) or 0)} событий, "
+                    f"{int(old_item.get('users', 0) or 0)} пользователей"
                 )
         lines.extend([
             "",

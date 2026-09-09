@@ -72,6 +72,10 @@ BITRIX_OPENLINE_ID=17
 BITRIX_INSTALL_TOKEN=xxxxxxxxx
 CONNECTOR_ADMIN_TOKEN=xxxxxxxxx
 BITRIX_APPLICATION_TOKEN=
+CONSILIUM_PAYMENT_SECRET=xxxxxxxxx
+BITRIX_PAYMENT_DIALOG_ID=chat123
+CONSILIUM_METRICS_SECRET=другой_xxxxxxxxx
+BITRIX_METRICS_DIALOG_ID=
 
 MAX_API_URL=https://platform-api2.max.ru
 MAX_BOT_TOKEN=xxxxxxxxx
@@ -120,8 +124,9 @@ SUMMARY_AI_CONCURRENCY=2
 
 openssl rand -hex 32
 
-Выполнить команду три раза и использовать разные значения для:
-BITRIX_INSTALL_TOKEN, CONNECTOR_ADMIN_TOKEN и MAX_WEBHOOK_SECRET.
+Выполнить команду пять раз и использовать разные значения для:
+BITRIX_INSTALL_TOKEN, CONNECTOR_ADMIN_TOKEN, MAX_WEBHOOK_SECRET,
+CONSILIUM_PAYMENT_SECRET и CONSILIUM_METRICS_SECRET.
 
 chmod 600 /root/bitrix_connector/.env
 
