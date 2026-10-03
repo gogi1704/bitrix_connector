@@ -47,14 +47,19 @@ async def bitrix_api_error_handler(_: Request, exc: BitrixApiError):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
+    worker_health = worker.health()
+    payload = {
+        "status": "ok" if worker_health["alive"] else "degraded",
+        "worker": worker_health,
         "queue": MessageDatabase().queue_status(),
         "capabilities": {
             "consilium_payment_schedule_fields": True,
             "consilium_funnel_reports": True,
         },
     }
+    if not worker_health["alive"]:
+        return JSONResponse(status_code=503, content=payload)
+    return payload
 
 
 @app.get("/")

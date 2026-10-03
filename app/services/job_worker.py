@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from app.config import Config
 from app.services.message_router import MessageRouter
@@ -21,11 +22,51 @@ class JobWorker:
         self.task: asyncio.Task | None = None
         self.background_tasks: set[asyncio.Task] = set()
         self.summary_semaphore = asyncio.Semaphore(max(1, Config.SUMMARY_AI_CONCURRENCY))
+        self.started_at: str | None = None
+        self.last_poll_at: str | None = None
+        self.last_successful_poll_at: str | None = None
+        self.last_job_completed_at: str | None = None
+        self.last_error: str | None = None
+        self.poll_errors = 0
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def health(self) -> dict:
+        return {
+            "alive": bool(self.task and not self.task.done()),
+            "started_at": self.started_at,
+            "last_poll_at": self.last_poll_at,
+            "last_successful_poll_at": self.last_successful_poll_at,
+            "last_job_completed_at": self.last_job_completed_at,
+            "last_error": self.last_error,
+            "poll_errors": self.poll_errors,
+        }
 
     async def start(self) -> None:
+        if self.task and not self.task.done():
+            return
         self.database.recover_processing_jobs()
         self.database.purge_old_jobs()
+        self.started_at = self._now()
+        self.last_error = None
         self.task = asyncio.create_task(self._run(), name="webhook-job-worker")
+        self.task.add_done_callback(self._log_unexpected_stop)
+
+    def _log_unexpected_stop(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self.last_error = f"{type(error).__name__}: {error}"
+            logger.error(
+                "Webhook job worker stopped unexpectedly",
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        else:
+            self.last_error = "Worker stopped unexpectedly without an exception"
+            logger.error(self.last_error)
 
     async def stop(self) -> None:
         if self.task:
@@ -41,7 +82,22 @@ class JobWorker:
 
     async def _run(self) -> None:
         while True:
-            job = self.database.claim_job()
+            self.last_poll_at = self._now()
+            try:
+                job = self.database.claim_job()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.poll_errors += 1
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "Webhook job queue polling failed; worker will retry"
+                )
+                await asyncio.sleep(max(0.1, Config.JOB_POLL_SECONDS))
+                continue
+
+            self.last_successful_poll_at = self._now()
+            self.last_error = None
             if job is None:
                 await asyncio.sleep(Config.JOB_POLL_SECONDS)
                 continue
@@ -55,7 +111,23 @@ class JobWorker:
                 task.add_done_callback(self.background_tasks.discard)
                 continue
 
-            await self._execute(job)
+            try:
+                await self._execute(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Processing errors are normally handled by _execute. Keep this
+                # final boundary so a bookkeeping/SQLite error cannot silently
+                # terminate the entire persistent worker.
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "Webhook job %s escaped the worker boundary; continuing",
+                    job.get("id"),
+                )
+                await asyncio.sleep(max(0.1, Config.JOB_POLL_SECONDS))
+                continue
+
+            self.last_job_completed_at = self._now()
 
     async def _execute(self, job: dict, *, background: bool = False) -> None:
         try:

@@ -1,3 +1,4 @@
+import asyncio
 import sqlite3
 import tempfile
 import time
@@ -75,6 +76,42 @@ class FakeRequest:
 
     async def json(self):
         return self._json
+
+
+class JobWorkerResilienceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_survives_transient_queue_polling_error(self):
+        worker = JobWorker()
+        successful_poll = asyncio.Event()
+        calls = 0
+
+        def claim_job():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            successful_poll.set()
+            return None
+
+        worker.database = SimpleNamespace(claim_job=claim_job)
+        with patch.object(Config, "JOB_POLL_SECONDS", 0.01):
+            worker.task = asyncio.create_task(worker._run())
+            await asyncio.wait_for(successful_poll.wait(), timeout=1)
+
+            self.assertFalse(worker.task.done())
+            self.assertEqual(worker.poll_errors, 1)
+            self.assertIsNotNone(worker.last_successful_poll_at)
+            self.assertTrue(worker.health()["alive"])
+
+            worker.task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await worker.task
+
+    async def test_worker_health_detects_stopped_task(self):
+        worker = JobWorker()
+        worker.task = asyncio.create_task(asyncio.sleep(0))
+        await worker.task
+
+        self.assertFalse(worker.health()["alive"])
 
 
 class SecurityTests(unittest.IsolatedAsyncioTestCase):
