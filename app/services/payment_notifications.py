@@ -20,14 +20,18 @@ class PaymentNotificationService:
             f"• {item['name']} — {cls._money(item['amount_kopecks'], payload['currency'])}"
             for item in items
         ]
+        psychology_session = payload.get("order_type") == "psychology_session"
         lines = [
-            "[B]✅ Оплата подтверждена[/B]",
+            "[B]✅ Оплата сессии с психологом подтверждена[/B]"
+            if psychology_session else "[B]✅ Оплата подтверждена[/B]",
             "",
             f"[B]Клиент:[/B] {payload.get('client_name') or 'Не указано'}",
             f"[B]ИНН:[/B] {payload.get('company_inn') or 'Не указан'}",
             f"[B]Организация:[/B] {payload.get('organization_name') or 'Не определена'}",
-            f"[B]Бригада:[/B] {payload.get('brigade') or 'Не определена'}",
-            f"[B]Дата медосмотра:[/B] {payload.get('examination_date') or 'Не определена'}",
+            *([] if psychology_session else [
+                f"[B]Бригада:[/B] {payload.get('brigade') or 'Не определена'}",
+                f"[B]Дата медосмотра:[/B] {payload.get('examination_date') or 'Не определена'}",
+            ]),
             "",
             f"[B]Заказ Консилиума:[/B] {payload['order_id']}",
             f"[B]Платёж ЮKassa:[/B] {payload['provider_payment_id']}",
@@ -46,12 +50,21 @@ class PaymentNotificationService:
 
     @classmethod
     async def send(cls, payload: dict) -> None:
-        if not Config.BITRIX_PAYMENT_DIALOG_ID:
-            raise RuntimeError("BITRIX_PAYMENT_DIALOG_ID is not configured")
+        psychology_session = payload.get("order_type") == "psychology_session"
+        dialog_id = (
+            Config.BITRIX_PSYCHOLOGY_PAYMENT_DIALOG_ID
+            if psychology_session else Config.BITRIX_PAYMENT_DIALOG_ID
+        )
+        setting_name = (
+            "BITRIX_PSYCHOLOGY_PAYMENT_DIALOG_ID"
+            if psychology_session else "BITRIX_PAYMENT_DIALOG_ID"
+        )
+        if not dialog_id:
+            raise RuntimeError(f"{setting_name} is not configured")
         await BitrixClient().call(
             "im.message.add",
             {
-                "DIALOG_ID": Config.BITRIX_PAYMENT_DIALOG_ID,
+                "DIALOG_ID": dialog_id,
                 "MESSAGE": cls.render(payload),
                 "SYSTEM": "N",
                 "URL_PREVIEW": "N",

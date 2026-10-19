@@ -136,6 +136,9 @@ def validate_payment_notification(payload) -> dict:
     if status != "succeeded":
         raise HTTPException(status_code=422, detail="Only succeeded payments are accepted")
     currency = required_text("currency", 3, r"[A-Z]{3}")
+    order_type = str(payload.get("order_type") or "examinations").strip()
+    if order_type not in {"examinations", "consultation", "psychology_session"}:
+        raise HTTPException(status_code=422, detail="Invalid order_type")
     try:
         amount_kopecks = int(payload.get("amount_kopecks"))
     except (TypeError, ValueError):
@@ -169,6 +172,7 @@ def validate_payment_notification(payload) -> dict:
         "order_id": order_id,
         "provider_payment_id": provider_payment_id,
         "status": status,
+        "order_type": order_type,
         "amount_kopecks": amount_kopecks,
         "currency": currency,
         "client_name": str(payload.get("client_name", "")).strip()[:100],

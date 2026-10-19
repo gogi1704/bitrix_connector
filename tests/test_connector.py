@@ -209,6 +209,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
             "order_id": "ord_123",
             "provider_payment_id": "2abc-def",
             "status": "succeeded",
+            "order_type": "examinations",
             "amount_kopecks": 1500000,
             "currency": "RUB",
             "client_name": "Иван Иванов",
@@ -227,6 +228,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         call = database.return_value.enqueue.call_args.kwargs
         self.assertEqual(call["dedupe_key"], "consilium:payment:ord_123")
         self.assertEqual(call["job_type"], "consilium_payment_notification")
+        self.assertEqual(call["payload"]["order_type"], "examinations")
 
         invalid = dict(payload, status="pending")
         with self.assertRaises(HTTPException) as raised:
@@ -237,6 +239,7 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "order_id": "ord_123", "provider_payment_id": "payment-123",
             "status": "succeeded", "amount_kopecks": 1500000, "currency": "RUB",
+            "order_type": "examinations",
             "client_name": "Иван Иванов", "company_inn": "7701234567",
             "organization_name": "ООО Пример", "paid_at": "2026-09-01T12:00:00Z",
             "brigade": "Бригада 7", "examination_date": "2026-09-15",
@@ -255,6 +258,28 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Чекап", params["MESSAGE"])
         self.assertIn("Бригада 7", params["MESSAGE"])
         self.assertIn("2026-09-15", params["MESSAGE"])
+
+    async def test_psychology_payment_uses_separate_dialog(self):
+        payload = {
+            "order_id": "session_123", "provider_payment_id": "payment-psych-123",
+            "status": "succeeded", "order_type": "psychology_session",
+            "amount_kopecks": 350000, "currency": "RUB",
+            "client_name": "Анна", "company_inn": "7701234567",
+            "organization_name": "ООО Пример", "paid_at": "2026-10-19T12:00:00Z",
+            "test": False,
+            "items": [{"name": "Сессия с психологом", "amount_kopecks": 350000}],
+        }
+        with (
+            patch.object(Config, "BITRIX_PAYMENT_DIALOG_ID", "chat-common"),
+            patch.object(Config, "BITRIX_PSYCHOLOGY_PAYMENT_DIALOG_ID", "chat-psychology"),
+            patch("app.services.payment_notifications.BitrixClient") as client,
+        ):
+            client.return_value.call = AsyncMock(return_value={"result": 42})
+            await PaymentNotificationService.send(payload)
+        _method, params = client.return_value.call.await_args.args
+        self.assertEqual(params["DIALOG_ID"], "chat-psychology")
+        self.assertIn("Оплата сессии с психологом", params["MESSAGE"])
+        self.assertNotIn("Дата медосмотра", params["MESSAGE"])
 
     async def test_payment_dialog_setup_uses_recent_dialogs(self):
         with patch("app.routes.bitrix.BitrixClient") as client:

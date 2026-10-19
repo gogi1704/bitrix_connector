@@ -534,6 +534,7 @@ ngrok URL и регистрирует актуальный.
 
 CONSILIUM_PAYMENT_SECRET=<случайная строка не короче 32 символов>
 BITRIX_PAYMENT_DIALOG_ID=chat123
+BITRIX_PSYCHOLOGY_PAYMENT_DIALOG_ID=chat456
 CONSILIUM_METRICS_SECRET=<другая случайная строка не короче 32 символов>
 BITRIX_METRICS_DIALOG_ID=chat78447
 
