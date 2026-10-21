@@ -55,6 +55,7 @@ def health():
         "capabilities": {
             "consilium_payment_schedule_fields": True,
             "consilium_funnel_reports": True,
+            "consilium_manager_user_reports": True,
         },
     }
     if not worker_health["alive"]:

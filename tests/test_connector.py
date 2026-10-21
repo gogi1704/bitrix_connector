@@ -20,10 +20,12 @@ from app.routes.bitrix import (
     operator_job_payload,
     receive_consilium_payment,
     receive_consilium_funnel_report,
+    receive_consilium_manager_user_report,
     require_admin_token,
     require_consilium_payment_secret,
     require_consilium_metrics_secret,
     validate_funnel_report,
+    validate_manager_user_report,
     validate_payment_notification,
 )
 from app.routes.max import receive_max_webhook
@@ -35,6 +37,7 @@ from app.services.manager_tools import DialogSummaryService, ReminderService, Su
 from app.services.message_router import MessageRouter
 from app.services.payment_notifications import PaymentNotificationService
 from app.services.funnel_reports import FunnelReportService
+from app.services.manager_user_reports import ManagerUserReportService
 from app.services.followups import FollowupAgent, FollowupService
 from app.services.media import (
     attachment_metadata,
@@ -177,6 +180,45 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as raised:
             validate_funnel_report({**payload, "chel_id": "forbidden"})
         self.assertEqual(raised.exception.status_code, 422)
+
+    async def test_manager_user_report_is_private_deduplicated_and_rendered(self):
+        payload = {
+            "schema_version": 1,
+            "report_id": "consilium-manager-users-2026-10-20",
+            "date": "2026-10-20",
+            "timezone": "Europe/Moscow",
+            "dialog_id": "chat123",
+            "total_users": 7,
+            "attributed_users": 6,
+            "unattributed_users": 1,
+            "managers": [{
+                "from_manager": "manager_1",
+                "manager_name": "Красильникова",
+                "users": 3,
+            }, {
+                "from_manager": "manager_2",
+                "manager_name": "Аминева",
+                "users": 0,
+            }],
+        }
+        with patch("app.routes.bitrix.MessageDatabase") as database:
+            database.return_value.enqueue.return_value = True
+            result = await receive_consilium_manager_user_report(FakeRequest(json=payload))
+        self.assertEqual(result["status"], "queued")
+        call = database.return_value.enqueue.call_args.kwargs
+        self.assertEqual(call["job_type"], "consilium_manager_user_report")
+        self.assertEqual(
+            call["dedupe_key"],
+            "consilium:manager-users:consilium-manager-users-2026-10-20",
+        )
+        self.assertEqual(validate_manager_user_report(payload), payload)
+        with self.assertRaises(HTTPException):
+            validate_manager_user_report({**payload, "chel_id": "forbidden"})
+        rendered = ManagerUserReportService.render(payload)
+        self.assertIn("Новые пользователи по менеджерам", rendered)
+        self.assertIn("Красильникова: 3 новых пользователя", rendered)
+        self.assertIn("Аминева: 0 новых пользователей", rendered)
+        self.assertIn("Без метки менеджера: 1", rendered)
 
     async def test_funnel_report_uses_regular_chat_message(self):
         payload = self.funnel_payload()

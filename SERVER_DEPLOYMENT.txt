@@ -537,12 +537,15 @@ BITRIX_PAYMENT_DIALOG_ID=chat123
 BITRIX_PSYCHOLOGY_PAYMENT_DIALOG_ID=chat456
 CONSILIUM_METRICS_SECRET=<другая случайная строка не короче 32 символов>
 BITRIX_METRICS_DIALOG_ID=chat78447
+BITRIX_MANAGER_REPORT_DIALOG_ID=chat123
 
 То же значение секрета укажите в .env Консилиума как BITRIX_PAYMENT_SECRET.
 Секрет CONSILIUM_METRICS_SECRET укажите в .env Консилиума как
 BITRIX_METRICS_SECRET. Он должен отличаться от секрета платежей. Если
 BITRIX_METRICS_DIALOG_ID оставить пустым, используется чат, выбранный в
-админке Консилиума.
+админке Консилиума. `BITRIX_MANAGER_REPORT_DIALOG_ID` при заполнении переопределяет чат
+ежедневного отчёта по новым пользователям менеджеров; иначе используется
+`MANAGER_DAILY_REPORT_DIALOG_ID` из Консилиума.
 Доступные OAuth-пользователю диалоги можно получить защищённым запросом
 GET /bitrix/payments/dialogs с заголовком X-Connector-Admin-Token.
 После изменения пересоберите оба контейнера. Пользователь OAuth-приложения

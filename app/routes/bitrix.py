@@ -119,6 +119,58 @@ def validate_funnel_report(payload) -> dict:
     return payload
 
 
+def validate_manager_user_report(payload) -> dict:
+    """Accept only bounded manager-level aggregates without user details."""
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="JSON object is required")
+    if payload.get("schema_version") != 1:
+        raise HTTPException(status_code=422, detail="Unsupported schema_version")
+    allowed_fields = {
+        "schema_version", "report_id", "test", "date", "timezone", "dialog_id",
+        "total_users", "attributed_users", "unattributed_users", "managers", "privacy",
+    }
+    if set(payload) - allowed_fields:
+        raise HTTPException(status_code=422, detail="Report contains unsupported fields")
+    report_id = str(payload.get("report_id", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,100}", report_id):
+        raise HTTPException(status_code=422, detail="Invalid report_id")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(payload.get("date", ""))):
+        raise HTTPException(status_code=422, detail="Invalid report date")
+    dialog_id = str(payload.get("dialog_id", "")).strip()
+    if dialog_id and not re.fullmatch(r"(?:chat|sg)?\d+", dialog_id):
+        raise HTTPException(status_code=422, detail="Invalid dialog_id")
+    if not dialog_id and not Config.BITRIX_MANAGER_REPORT_DIALOG_ID:
+        raise HTTPException(status_code=422, detail="Manager report dialog is required")
+    managers = payload.get("managers")
+    if not isinstance(managers, list) or len(managers) > 100:
+        raise HTTPException(status_code=422, detail="Invalid managers")
+    for item in managers:
+        if not isinstance(item, dict) or set(item) - {
+            "from_manager", "manager_name", "users",
+        }:
+            raise HTTPException(status_code=422, detail="Invalid manager aggregate")
+        if len(str(item.get("from_manager", ""))) > 80 or len(str(item.get("manager_name", ""))) > 100:
+            raise HTTPException(status_code=422, detail="Invalid manager label")
+        for key in ("users",):
+            try:
+                value = int(item.get(key, 0))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=422, detail="Invalid manager count") from None
+            if value < 0 or value > 100_000_000:
+                raise HTTPException(status_code=422, detail="Invalid manager count")
+    for key in ("total_users", "attributed_users", "unattributed_users"):
+        try:
+            value = int(payload.get(key, 0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Invalid report total") from None
+        if value < 0 or value > 100_000_000:
+            raise HTTPException(status_code=422, detail="Invalid report total")
+    forbidden = {"chel_id", "phone", "messages", "answers", "tube_number"}
+    if forbidden.intersection(payload):
+        raise HTTPException(status_code=422, detail="Report contains forbidden fields")
+    return payload
+
+
 def validate_payment_notification(payload) -> dict:
     """Return a bounded, queue-safe notification without accepting arbitrary data."""
     if not isinstance(payload, dict):
@@ -285,6 +337,28 @@ async def receive_consilium_funnel_report(request: Request):
         job_type="consilium_funnel_report",
         payload=payload,
         dedupe_key=f"consilium:funnel:{payload['report_id']}",
+    )
+    return {
+        "status": "queued" if accepted else "duplicate",
+        "report_id": payload["report_id"],
+    }
+
+
+@router.post(
+    "/reports/manager-users",
+    status_code=202,
+    dependencies=[Depends(require_consilium_metrics_secret)],
+)
+async def receive_consilium_manager_user_report(request: Request):
+    """Queue the daily aggregate of new users attributed to each manager."""
+    try:
+        payload = validate_manager_user_report(await request.json())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
+    accepted = MessageDatabase().enqueue(
+        job_type="consilium_manager_user_report",
+        payload=payload,
+        dedupe_key=f"consilium:manager-users:{payload['report_id']}",
     )
     return {
         "status": "queued" if accepted else "duplicate",
