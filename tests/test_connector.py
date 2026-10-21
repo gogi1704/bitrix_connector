@@ -219,8 +219,8 @@ class SecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Красильникова: 3 новых пользователя", rendered)
         self.assertIn("Аминева: 0 новых пользователей", rendered)
         self.assertIn("Без метки менеджера: 1", rendered)
-        self.assertIn("впервые попавшие на первый посадочный экран", rendered)
-        self.assertIn("Завершать вход", rendered)
+        self.assertNotIn("впервые попавшие на первый посадочный экран", rendered)
+        self.assertNotIn("Завершать вход", rendered)
 
     async def test_funnel_report_uses_regular_chat_message(self):
         payload = self.funnel_payload()

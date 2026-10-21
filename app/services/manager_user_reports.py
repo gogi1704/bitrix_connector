@@ -41,13 +41,6 @@ class ManagerUserReportService:
                 f"• {cls._safe(item.get('manager_name') or item.get('from_manager'))}: "
                 f"{cls._new_users_label(users)}"
             )
-        lines.extend([
-            "",
-            "[I]Считаются новые пользователи, впервые попавшие на первый "
-            "посадочный экран Консилиума в указанный день. Завершать вход для "
-            "попадания в отчёт не требуется. В отчёте нет персональных и "
-            "медицинских данных.[/I]",
-        ])
         return "\n".join(lines)
 
     @classmethod
