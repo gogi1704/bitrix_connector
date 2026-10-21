@@ -39,41 +39,6 @@ class FunnelReportService:
             f"[B]Зарегистрировались:[/B] {int(summary.get('users', 0) or 0)} "
             f"(ранее {int(previous_summary.get('users', 0) or 0)})",
         ]
-        daily = payload.get("new_users_daily") or {}
-        daily_current = daily.get("current") or {}
-        daily_previous = daily.get("comparison") or {}
-        if daily_current:
-            lines.extend([
-                "",
-                f"[B]Новые пользователи за {cls._safe(daily.get('date'), 10)}[/B]",
-                f"Впервые открыли Консилиум: "
-                f"{int(daily_current.get('first_visitors', 0) or 0)} "
-                f"(днём ранее {int(daily_previous.get('first_visitors', 0) or 0)})",
-                f"Завершили вход: {int(daily_current.get('registered_users', 0) or 0)} "
-                f"(днём ранее {int(daily_previous.get('registered_users', 0) or 0)})",
-                f"Конверсия новых посетителей во вход: "
-                f"{float(daily_current.get('registration_conversion', 0) or 0):g}% "
-                f"(днём ранее "
-                f"{float(daily_previous.get('registration_conversion', 0) or 0):g}%)",
-                f"Привязали Telegram или MAX: "
-                f"{int(daily_current.get('messenger_linked_users', 0) or 0)}",
-                f"Открыли новый диалог: {int(daily_current.get('chat_users', 0) or 0)} · "
-                f"написали сообщение: {int(daily_current.get('message_users', 0) or 0)} · "
-                f"открыли психологический чат: "
-                f"{int(daily_current.get('psychology_chat_users', 0) or 0)}",
-            ])
-            routes = daily_current.get("routes") or []
-            if routes:
-                lines.append("[B]Куда пришли:[/B] " + " · ".join(
-                    f"{cls._safe(item.get('label'), 80)} — {int(item.get('users', 0) or 0)}"
-                    for item in routes[:10]
-                ))
-            methods = daily_current.get("registration_methods") or []
-            if methods:
-                lines.append("[B]Как вошли:[/B] " + " · ".join(
-                    f"{cls._safe(item.get('label'), 80)} — {int(item.get('users', 0) or 0)}"
-                    for item in methods[:10]
-                ))
         for flow in payload.get("flows") or []:
             flow_summary = flow.get("summary") or {}
             start_users = int(flow_summary.get("start_users", 0) or 0)
